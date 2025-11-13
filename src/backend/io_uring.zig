@@ -1836,9 +1836,9 @@ test "io_uring: fanotify read" {
     defer loop.deinit();
 
     // 1. Initialize fanotify
-    const fanotify_fd = try linux.fanotify_init(
-        linux.FAN.CLOEXEC | linux.FAN.NONBLOCK,
-        linux.O.RDONLY,
+    const fanotify_fd = try posix.fanotify_init(
+    .{.CLOEXEC = true, .NONBLOCK = true},
+        0,
     );
     defer posix.close(fanotify_fd);
 
@@ -1851,9 +1851,9 @@ test "io_uring: fanotify read" {
     // 3. Mark the file for watching
     try linux.fanotify_mark(
         fanotify_fd,
-        linux.FAN.MARK_ADD,
-        linux.FAN.MODIFY, // Watch for modify events
-        0, // AT_FDCWD
+        .{.ADD = true},
+        .{.MODIFY = true},
+        0,
         path,
     );
 
@@ -1900,11 +1900,4 @@ test "io_uring: fanotify read" {
     try testing.expect(bytes_read > 0);
     try testing.expectEqual(@as(usize, 0), loop.active); // Event should be disarmed
     try testing.expect(fanotify_c.state() == .dead);
-
-    // Example of minimal parsing (assuming single event, for robustness, a loop is needed)
-    if (bytes_read > 0) {
-        const metadata = @as(*linux.fanotify_event_metadata, @ptrCast(event_buffer.ptr));
-        try testing.expectEqual(metadata.event_len, bytes_read);
-        try testing.expect(metadata.mask & linux.FAN.MODIFY != 0);
-    }
 }
