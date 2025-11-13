@@ -1859,9 +1859,18 @@ test "io_uring: fanotify read" {
 
     // 4. Prepare buffer and completion for reading fanotify events
     var event_buffer: [1024]u8 = undefined;
-    var bytes_read: usize = 0;
+
+    // Define a struct to hold all necessary callback data
+    const FanotifyCallbackData = struct {
+        bytes_read: usize,
+        event_triggered: bool,
+    };
+    var callback_data: FanotifyCallbackData = .{
+        .bytes_read = 0,
+        .event_triggered = false,
+    };
+
     var fanotify_c: Completion = undefined;
-    var event_triggered = false;
 
     const fanotify_callback: Callback = (struct {
         fn callback(
@@ -1871,9 +1880,11 @@ test "io_uring: fanotify read" {
             r: Result,
         ) CallbackAction {
             _ = l;
-            const br_ptr = @as(*usize, @ptrCast(@alignCast(ud.?)));
-            br_ptr.* = r.fanotify catch unreachable; // Store bytes read
-            @as(*bool, @ptrCast(@alignCast(c.userdata.?))).* = true; // Mark as triggered
+            _ = c;
+            // Cast ud to the new struct type
+            const data = @as(*FanotifyCallbackData, @ptrCast(@alignCast(ud.?)));
+            data.bytes_read = r.fanotify catch unreachable; // Store bytes read
+            data.event_triggered = true; // Mark as triggered
 
             // In a real application, you would parse the event_buffer here.
             // For this test, we just check if bytes were read.
@@ -1881,8 +1892,8 @@ test "io_uring: fanotify read" {
         }
     }).callback;
 
-    loop.fanotify_read(&fanotify_c, fanotify_fd, .{ .slice = &event_buffer }, &bytes_read, fanotify_callback);
-    fanotify_c.userdata = &event_triggered;
+    // Pass the address of the combined struct as userdata
+    loop.fanotify_read(&fanotify_c, fanotify_fd, .{ .slice = &event_buffer }, &callback_data, fanotify_callback);
 
     // Initial tick to submit the event
     try loop.run(.no_wait);
@@ -1896,8 +1907,8 @@ test "io_uring: fanotify read" {
     try loop.run(.until_done);
 
     // 7. Verify the callback was triggered and bytes were read
-    try testing.expect(event_triggered);
-    try testing.expect(bytes_read > 0);
+    try testing.expect(callback_data.event_triggered);
+    try testing.expect(callback_data.bytes_read > 0);
     try testing.expectEqual(@as(usize, 0), loop.active); // Event should be disarmed
     try testing.expect(fanotify_c.state() == .dead);
 }
