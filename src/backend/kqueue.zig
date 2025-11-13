@@ -2838,6 +2838,18 @@ test "kqueue: socket accept/cancel cancellation should decrease active count" {
     try testing.expect(ln == 0);
 }
 
+//NOTE: lets check again the tests for errors,
+//after that, add a watcher,
+//it need to handle files or directories
+//for any other backend it will be noop
+//The user will select what flags want to activate,
+//and is his job check what trigger the callback that he write,
+//or i can let the user define a callback per trigger and only for the ones that he define a callback gets added to the file descriptor
+//I'm not sure
+//remember to read the zig impl of his watcher, there is some case where if you try to watch over a directory you need to watch every file inside and that's a problem
+// https://github.com/ziglang/zig/blob/cc671a2d400c6a8238f77eb3f0bd9a749714b8e5/lib/std/Build/Watch.zig
+//check what flags are used for eviting that case
+
 test "kqueue: vnode delete" {
     if (builtin.os.tag != .macos and builtin.os.tag != .freebsd) return error.SkipZigTest;
 
@@ -2875,14 +2887,7 @@ test "kqueue: vnode delete" {
         }).callback;
 
         // Add a vnode watch for delete events
-        loop.vnode(&vnode_c, file.handle, std.c.NOTE.DELETE |
-                     std.c.NOTE.WRITE |
-                     std.c.NOTE.EXTEND |
-                     std.c.NOTE.ATTRIB |
-                     std.c.NOTE.LINK |
-                     std.c.NOTE.RENAME |
-                     std.c.NOTE.REVOKE |
-                     std.c.NOTE.FUNLOCK, &received_flags, vnode_callback);
+        loop.vnode(&vnode_c, file.handle, std.c.NOTE.DELETE, &received_flags, vnode_callback);
 
         // Initial tick to submit the event to kqueue
         try loop.run(.no_wait);
@@ -2917,6 +2922,7 @@ test "kqueue: vnode event - write" {
     const path = "test_vnode_file_write";
     var file = try fs.cwd().createFile(path, .{});
     defer file.close();
+    defer fs.cwd().deleteFile(path) catch {};
     errdefer fs.cwd().deleteFile(path) catch {};
 
     var received_flags: u32 = 0;
@@ -2972,6 +2978,7 @@ test "kqueue: vnode event - cancellation" {
     const path = "test_vnode_file_cancel";
     var file = try fs.cwd().createFile(path, .{});
     defer file.close();
+    defer fs.cwd().deleteFile(path) catch {};
     errdefer fs.cwd().deleteFile(path) catch {};
 
     var vnode_triggered = false;
