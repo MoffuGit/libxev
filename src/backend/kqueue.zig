@@ -689,6 +689,28 @@ pub const Loop = struct {
             self.completions.empty());
     }
 
+    pub fn vnode(
+        self: *Loop,
+        c: *Completion,
+        fd: posix.fd_t,
+        flags: u32,
+        userdata: ?*anyopaque,
+        comptime cb: Callback,
+    ) void {
+        c.* = .{
+            .op = .{
+                .vnode = .{
+                    .fd = fd,
+                    .flags = flags,
+                },
+            },
+            .userdata = userdata,
+            .callback = cb,
+        };
+
+        self.add(c);
+    }
+
     /// Start the completion. This returns true if the Kevent was set
     /// and should be queued.
     fn start(self: *Loop, c: *Completion, ev: *Kevent) bool {
@@ -791,6 +813,11 @@ pub const Loop = struct {
             .machport => action: {
                 ev.* = c.kevent().?;
                 break :action .{ .kevent = {} };
+            },
+
+            .vnode => action: {
+                ev.* = c.kevent().?;
+                break :action .{.kevent = {} };
             },
 
             .proc => action: {
@@ -1093,6 +1120,15 @@ pub const Completion = struct {
                 };
             },
 
+            .vnode => |v| kevent_init(.{
+              .ident = @intCast(v.fd),
+              .filter = std.c.EVFILT.VNODE,
+              .flags = std.c.EV.ADD | std.c.EV.ENABLE,
+              .fflags = v.flags,
+              .data = 0,
+              .udata = @intFromPtr(self),
+            }),
+
             .proc => |v| kevent_init(.{
                 .ident = @intCast(v.pid),
                 .filter = std.c.EVFILT.PROC,
@@ -1258,6 +1294,11 @@ pub const Completion = struct {
                 .machport = {},
             },
 
+            .vnode => res: {
+              const ev = ev_ orelse break :res .{ .vnode = VNodeError.MissingKevent };
+              break :res .{ .vnode = ev.fflags };
+            },
+
             // For proc watching, it is identical to the syscall result.
             .proc => res: {
                 const ev = ev_ orelse break :res .{ .proc = ProcError.MissingKevent };
@@ -1376,6 +1417,14 @@ pub const Completion = struct {
                     .CANCELED => error.Canceled,
                     else => |err| posix.unexpectedErrno(err),
                 },
+            },
+
+            .vnode => .{
+              .vnode = switch (errno) {
+                  .SUCCESS => @intCast(r),
+                  .CANCELED => error.Canceled,
+                  else => |err| posix.unexpectedErrno(err),
+              },
             },
 
             .proc => .{
@@ -1518,6 +1567,7 @@ pub const OperationType = enum {
     cancel,
     machport,
     proc,
+    vnode,
 };
 
 /// All the supported operations of this event loop. These are always
@@ -1611,6 +1661,11 @@ pub const Operation = union(OperationType) {
         pid: posix.pid_t,
         flags: u32 = NOTE_EXIT_FLAGS,
     },
+
+    vnode: struct {
+        fd: posix.fd_t,
+        flags: u32,
+    },
 };
 
 pub const Result = union(OperationType) {
@@ -1631,6 +1686,13 @@ pub const Result = union(OperationType) {
     cancel: CancelError!void,
     machport: MachPortError!void,
     proc: ProcError!u32,
+    vnode: VNodeError!u32
+};
+
+pub const VNodeError = posix.KEventError || error{
+    Canceled,
+    MissingKevent,
+    Unexpected,
 };
 
 const ThreadPoolError = error{
@@ -2774,4 +2836,203 @@ test "kqueue: socket accept/cancel cancellation should decrease active count" {
     // Wait for the sockets to close
     try loop.run(.until_done);
     try testing.expect(ln == 0);
+}
+
+test "kqueue: vnode delete" {
+    if (builtin.os.tag != .macos and builtin.os.tag != .freebsd) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const fs = std.fs;
+
+    var loop = try Loop.init(.{});
+    defer loop.deinit();
+
+    // Create a temporary file to watch
+    const path = "test_vnode_file_delete";
+    var file = try fs.cwd().createFile(path, .{});
+
+    var received_flags: u32 = 0;
+    var vnode_c: Completion = undefined;
+    {
+        errdefer file.close();
+        errdefer fs.cwd().deleteFile(path) catch {};
+
+
+        // Define the callback for the vnode event
+        const vnode_callback: Callback = (struct {
+            fn callback(
+                ud: ?*anyopaque,
+                l: *Loop,
+                c: *Completion,
+                r: Result,
+            ) CallbackAction {
+                _ = l;
+                _ = c;
+                const flags_ptr: *u32 = @ptrCast(@alignCast(ud.?));
+                flags_ptr.* = r.vnode catch unreachable;
+                return .disarm;
+            }
+        }).callback;
+
+        // Add a vnode watch for delete events
+        loop.vnode(&vnode_c, file.handle, std.c.NOTE.DELETE |
+                     std.c.NOTE.WRITE |
+                     std.c.NOTE.EXTEND |
+                     std.c.NOTE.ATTRIB |
+                     std.c.NOTE.LINK |
+                     std.c.NOTE.RENAME |
+                     std.c.NOTE.REVOKE |
+                     std.c.NOTE.FUNLOCK, &received_flags, vnode_callback);
+
+        // Initial tick to submit the event to kqueue
+        try loop.run(.no_wait);
+        try testing.expectEqual(@as(usize, 1), loop.active); // One active event
+
+    }
+
+    // Trigger the NOTE_DELETE event by deleting the file
+    //NOTE:
+    //if you close the file the callback never run
+    // file.close();
+    try fs.cwd().deleteFile(path);
+
+    // Run the loop until the event is processed
+    try loop.run(.until_done);
+
+    try testing.expectEqual(std.c.NOTE.DELETE | std.c.NOTE.LINK, received_flags);
+    try testing.expectEqual(@as(usize, 0), loop.active); // All events disarmed
+    try testing.expect(vnode_c.state() == .dead);
+}
+
+test "kqueue: vnode event - write" {
+    if (builtin.os.tag != .macos and builtin.os.tag != .freebsd) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const fs = std.fs;
+
+    var loop = try Loop.init(.{});
+    defer loop.deinit();
+
+    // Create a temporary file to watch
+    const path = "test_vnode_file_write";
+    var file = try fs.cwd().createFile(path, .{});
+    defer file.close();
+    errdefer fs.cwd().deleteFile(path) catch {};
+
+    var received_flags: u32 = 0;
+    var vnode_c: Completion = undefined;
+
+    // Define the callback for the vnode event
+    const vnode_callback: Callback = (struct {
+        fn callback(
+            ud: ?*anyopaque,
+            l: *Loop,
+            c: *Completion,
+            r: Result,
+        ) CallbackAction {
+            _ = l;
+            _ = c;
+            const flags_ptr: *u32 = @ptrCast(@alignCast(ud.?));
+            flags_ptr.* = r.vnode catch unreachable;
+            return .disarm;
+        }
+    }).callback;
+
+    // Add a vnode watch for write events
+    loop.vnode(&vnode_c, file.handle, std.c.NOTE.WRITE, &received_flags, vnode_callback);
+
+    // Initial tick to submit the event to kqueue
+    try loop.run(.no_wait);
+    try testing.expectEqual(@as(usize, 1), loop.active); // One active event
+
+    // Trigger the NOTE_WRITE event by writing to the file
+    const content = "hello world";
+    try file.writeAll(content);
+    try file.sync(); // Ensure write is flushed to disk
+
+    // Run the loop until the event is processed
+    try loop.run(.until_done);
+
+    // Verify the callback was triggered with the correct flags
+    try testing.expectEqual(std.c.NOTE.WRITE, received_flags);
+    try testing.expectEqual(@as(usize, 0), loop.active); // All events disarmed
+    try testing.expect(vnode_c.state() == .dead);
+}
+
+test "kqueue: vnode event - cancellation" {
+    if (builtin.os.tag != .macos and builtin.os.tag != .freebsd) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const fs = std.fs;
+
+    var loop = try Loop.init(.{});
+    defer loop.deinit();
+
+    // Create a temporary file to watch
+    const path = "test_vnode_file_cancel";
+    var file = try fs.cwd().createFile(path, .{});
+    defer file.close();
+    errdefer fs.cwd().deleteFile(path) catch {};
+
+    var vnode_triggered = false;
+    var vnode_c: Completion = undefined;
+
+    // Define the callback for the vnode event
+    const vnode_callback: Callback = (struct {
+        fn callback(
+            ud: ?*anyopaque,
+            l: *Loop,
+            c: *Completion,
+            r: Result,
+        ) CallbackAction {
+            _ = l;
+            _ = c;
+            const triggered_ptr: *bool = @ptrCast(@alignCast(ud.?));
+            const err = r.vnode catch |e| e;
+            if (err == VNodeError.Canceled) {
+                triggered_ptr.* = false; // Set to false if canceled, so we can verify
+            } else {
+                @panic("unexpected vnode result");
+            }
+            return .disarm;
+        }
+    }).callback;
+
+    // Add a vnode watch for delete events
+    loop.vnode(&vnode_c, file.handle, std.c.NOTE.DELETE, &vnode_triggered, vnode_callback);
+
+    // Initial tick to submit the event to kqueue
+    try loop.run(.no_wait);
+    try testing.expectEqual(@as(usize, 1), loop.active); // One active event (vnode)
+
+    var cancel_called = false;
+    var c_cancel: Completion = .{
+        .op = .{ .cancel = .{ .c = &vnode_c } },
+        .userdata = &cancel_called,
+        .callback = (struct {
+            fn callback(
+                ud: ?*anyopaque,
+                l: *Loop,
+                c: *Completion,
+                r: Result,
+            ) CallbackAction {
+                _ = l;
+                _ = c;
+                _ = r.cancel catch unreachable;
+                const called_ptr: *bool = @ptrCast(@alignCast(ud.?));
+                called_ptr.* = true;
+                return .disarm;
+            }
+        }).callback,
+    };
+    loop.add(&c_cancel);
+
+    try loop.run(.until_done);
+
+    // Verify cancellation callback was called and vnode callback indicated cancellation
+    try testing.expect(cancel_called);
+    try testing.expect(!vnode_triggered); // Should be false due to cancellation
+    try testing.expectEqual(@as(usize, 0), loop.active);
+    try testing.expect(vnode_c.state() == .dead);
+    try testing.expect(c_cancel.state() == .dead);
 }
