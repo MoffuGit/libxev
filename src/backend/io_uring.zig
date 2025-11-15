@@ -344,27 +344,6 @@ pub const Loop = struct {
         };
     }
 
-    pub fn fanotify_read(
-        self: *Loop,
-        c: *Completion,
-        fanotify_fd: posix.fd_t,
-        buffer: ReadBuffer,
-        userdata: ?*anyopaque,
-        comptime cb: Callback,
-    ) void {
-        c.* = .{
-            .op = .{
-                .fanotify = .{
-                    .fd = fanotify_fd,
-                    .buffer = buffer,
-                },
-            },
-            .userdata = userdata,
-            .callback = cb,
-        };
-        self.add(c);
-    }
-
     /// Add a completion to the loop. This does NOT start the operation!
     /// You must call "submit" at some point to submit all of the queued
     /// work.
@@ -572,11 +551,6 @@ pub const Loop = struct {
             },
 
             .cancel => |v| sqe.prep_cancel(@intCast(@intFromPtr(v.c)), 0),
-
-            .fanotify => |*v| switch (v.buffer) {
-                .array => |*buf| sqe.prep_read(v.fd, buf, 0),
-                .slice => |buf| sqe.prep_read(v.fd, buf, 0)
-            }
         }
 
         // Our sqe user data always points back to the completion.
@@ -827,10 +801,6 @@ pub const Completion = struct {
                     else => |errno| posix.unexpectedErrno(errno),
                 },
             },
-
-            .fanotify => .{
-                .fanotify = self.readResult(.fanotify, res)
-            }
         };
 
         return self.callback(self.userdata, loop, self, result);
@@ -915,8 +885,6 @@ pub const OperationType = enum {
 
     /// Cancel an existing operation.
     cancel,
-
-    fanotify
 };
 
 /// The result type based on the operation type. For a callback, the
@@ -939,7 +907,6 @@ pub const Result = union(OperationType) {
     timer: TimerError!TimerTrigger,
     timer_remove: TimerRemoveError!void,
     cancel: CancelError!void,
-    fanotify: ReadError!usize,
 };
 
 /// All the supported operations of this event loop. These are always
@@ -1041,11 +1008,6 @@ pub const Operation = union(OperationType) {
     cancel: struct {
         c: *Completion,
     },
-
-    fanotify: struct {
-        fd: posix.fd_t,
-        buffer: ReadBuffer,
-    }
 };
 
 /// ReadBuffer are the various options for reading.
@@ -1824,91 +1786,4 @@ test "io_uring: socket read cancellation" {
     try loop.run(.until_done);
     try testing.expectEqual(OperationType.read, @as(OperationType, read_result));
     try testing.expectError(error.Canceled, read_result.read);
-}
-
-test "io_uring: fanotify read" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
-
-    const testing = std.testing;
-    const fs = std.fs;
-
-    var loop = try Loop.init(.{});
-    defer loop.deinit();
-
-    // 1. Initialize fanotify
-    const fanotify_fd = try posix.fanotify_init(
-    .{.CLOEXEC = true, .NONBLOCK = true},
-        0,
-    );
-    defer posix.close(fanotify_fd);
-
-    // 2. Create a temporary file to watch
-    const path = "test_fanotify_file";
-    var file = try fs.cwd().createFile(path, .{});
-    defer file.close();
-    defer fs.cwd().deleteFile(path) catch {};
-
-    // 3. Mark the file for watching
-    try linux.fanotify_mark(
-        fanotify_fd,
-        .{.ADD = true},
-        .{.MODIFY = true},
-        0,
-        path,
-    );
-
-    // 4. Prepare buffer and completion for reading fanotify events
-    var event_buffer: [1024]u8 = undefined;
-
-    // Define a struct to hold all necessary callback data
-    const FanotifyCallbackData = struct {
-        bytes_read: usize,
-        event_triggered: bool,
-    };
-    var callback_data: FanotifyCallbackData = .{
-        .bytes_read = 0,
-        .event_triggered = false,
-    };
-
-    var fanotify_c: Completion = undefined;
-
-    const fanotify_callback: Callback = (struct {
-        fn callback(
-            ud: ?*anyopaque,
-            l: *Loop,
-            c: *Completion,
-            r: Result,
-        ) CallbackAction {
-            _ = l;
-            _ = c;
-            // Cast ud to the new struct type
-            const data = @as(*FanotifyCallbackData, @ptrCast(@alignCast(ud.?)));
-            data.bytes_read = r.fanotify catch unreachable; // Store bytes read
-            data.event_triggered = true; // Mark as triggered
-
-            // In a real application, you would parse the event_buffer here.
-            // For this test, we just check if bytes were read.
-            return .disarm;
-        }
-    }).callback;
-
-    // Pass the address of the combined struct as userdata
-    loop.fanotify_read(&fanotify_c, fanotify_fd, .{ .slice = &event_buffer }, &callback_data, fanotify_callback);
-
-    // Initial tick to submit the event
-    try loop.run(.no_wait);
-    try testing.expectEqual(@as(usize, 1), loop.active); // One active event
-
-    // 5. Trigger the event (modify the file)
-    const content = "hello world";
-    _ = try file.writeAll(content);
-    _ = try file.sync(); // Ensure write is flushed to disk
-
-    try loop.run(.until_done);
-
-    // 7. Verify the callback was triggered and bytes were read
-    try testing.expect(callback_data.event_triggered);
-    try testing.expect(callback_data.bytes_read > 0);
-    try testing.expectEqual(@as(usize, 0), loop.active); // Event should be disarmed
-    try testing.expect(fanotify_c.state() == .dead);
 }

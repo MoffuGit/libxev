@@ -2838,18 +2838,6 @@ test "kqueue: socket accept/cancel cancellation should decrease active count" {
     try testing.expect(ln == 0);
 }
 
-//NOTE: lets check again the tests for errors,
-//after that, add a watcher,
-//it need to handle files or directories
-//for any other backend it will be noop
-//The user will select what flags want to activate,
-//and is his job check what trigger the callback that he write,
-//or i can let the user define a callback per trigger and only for the ones that he define a callback gets added to the file descriptor
-//I'm not sure
-//remember to read the zig impl of his watcher, there is some case where if you try to watch over a directory you need to watch every file inside and that's a problem
-// https://github.com/ziglang/zig/blob/cc671a2d400c6a8238f77eb3f0bd9a749714b8e5/lib/std/Build/Watch.zig
-//check what flags are used for eviting that case
-
 test "kqueue: vnode delete" {
     if (builtin.os.tag != .macos and builtin.os.tag != .freebsd) return error.SkipZigTest;
 
@@ -2895,7 +2883,6 @@ test "kqueue: vnode delete" {
 
     }
 
-    // Trigger the NOTE_DELETE event by deleting the file
     //NOTE:
     //if you close the file the callback never run
     // file.close();
@@ -2905,7 +2892,7 @@ test "kqueue: vnode delete" {
     try loop.run(.until_done);
 
     try testing.expectEqual(std.c.NOTE.DELETE | std.c.NOTE.LINK, received_flags);
-    try testing.expectEqual(@as(usize, 0), loop.active); // All events disarmed
+    try testing.expectEqual(@as(usize, 0), loop.active);
     try testing.expect(vnode_c.state() == .dead);
 }
 
@@ -2944,24 +2931,21 @@ test "kqueue: vnode event - write" {
         }
     }).callback;
 
-    // Add a vnode watch for write events
     loop.vnode(&vnode_c, file.handle, std.c.NOTE.WRITE, &received_flags, vnode_callback);
 
-    // Initial tick to submit the event to kqueue
     try loop.run(.no_wait);
-    try testing.expectEqual(@as(usize, 1), loop.active); // One active event
+    try testing.expectEqual(@as(usize, 1), loop.active);
 
     // Trigger the NOTE_WRITE event by writing to the file
     const content = "hello world";
     try file.writeAll(content);
-    try file.sync(); // Ensure write is flushed to disk
+    try file.sync();
 
     // Run the loop until the event is processed
     try loop.run(.until_done);
 
-    // Verify the callback was triggered with the correct flags
     try testing.expectEqual(std.c.NOTE.WRITE, received_flags);
-    try testing.expectEqual(@as(usize, 0), loop.active); // All events disarmed
+    try testing.expectEqual(@as(usize, 0), loop.active);
     try testing.expect(vnode_c.state() == .dead);
 }
 
@@ -2974,7 +2958,6 @@ test "kqueue: vnode event - cancellation" {
     var loop = try Loop.init(.{});
     defer loop.deinit();
 
-    // Create a temporary file to watch
     const path = "test_vnode_file_cancel";
     var file = try fs.cwd().createFile(path, .{});
     defer file.close();
@@ -2984,7 +2967,6 @@ test "kqueue: vnode event - cancellation" {
     var vnode_triggered = false;
     var vnode_c: Completion = undefined;
 
-    // Define the callback for the vnode event
     const vnode_callback: Callback = (struct {
         fn callback(
             ud: ?*anyopaque,
@@ -2997,7 +2979,7 @@ test "kqueue: vnode event - cancellation" {
             const triggered_ptr: *bool = @ptrCast(@alignCast(ud.?));
             const err = r.vnode catch |e| e;
             if (err == VNodeError.Canceled) {
-                triggered_ptr.* = false; // Set to false if canceled, so we can verify
+                triggered_ptr.* = false;
             } else {
                 @panic("unexpected vnode result");
             }
@@ -3005,12 +2987,10 @@ test "kqueue: vnode event - cancellation" {
         }
     }).callback;
 
-    // Add a vnode watch for delete events
     loop.vnode(&vnode_c, file.handle, std.c.NOTE.DELETE, &vnode_triggered, vnode_callback);
 
-    // Initial tick to submit the event to kqueue
     try loop.run(.no_wait);
-    try testing.expectEqual(@as(usize, 1), loop.active); // One active event (vnode)
+    try testing.expectEqual(@as(usize, 1), loop.active);
 
     var cancel_called = false;
     var c_cancel: Completion = .{
@@ -3036,9 +3016,8 @@ test "kqueue: vnode event - cancellation" {
 
     try loop.run(.until_done);
 
-    // Verify cancellation callback was called and vnode callback indicated cancellation
     try testing.expect(cancel_called);
-    try testing.expect(!vnode_triggered); // Should be false due to cancellation
+    try testing.expect(!vnode_triggered);
     try testing.expectEqual(@as(usize, 0), loop.active);
     try testing.expect(vnode_c.state() == .dead);
     try testing.expect(c_cancel.state() == .dead);
