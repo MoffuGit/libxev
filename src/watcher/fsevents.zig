@@ -1,0 +1,276 @@
+const std = @import("std");
+const posix = std.posix;
+const common = @import("common.zig");
+
+pub fn FsEvents(comptime xev: type) type {
+    if (xev.dynamic) return FsEventsDynamic(xev);
+
+    return switch (xev.backend) {
+        .io_uring => InotifyFsEvents(xev),
+        .kqueue => KqueueFsEvents(xev),
+        else => struct {}
+    };
+}
+
+pub fn InotifyFsEvents(comptime xev: type) type {
+    return struct {
+        const FsEventError = enum {
+            Unexpected
+        };
+
+        pub const FsEvent = struct {
+          delete: bool = false,
+          write: bool = false,
+          extend: bool = false,
+          attrib: bool = false,
+          rename: bool = false,
+          revoke: bool = false,
+        };
+
+        const Self = @This();
+
+        wd: i32,
+
+        pub fn init(path: []const u8) !Self {
+            try xev.init_inotify();
+
+            const wd = try xev.add_inotify_mark(path);
+
+            return .{ .wd = wd };
+        }
+
+        pub fn deinit(self: *Self) void {
+            xev.remove_inotify_mark(self.wd);
+        }
+
+        pub fn wait(
+            self: Self,
+            loop: *xev.Loop,
+            c: *xev.Completion,
+            comptime Userdata: type,
+            userdata: ?*Userdata,
+            comptime cb: *const fn (
+                ud: ?*Userdata,
+                l: *xev.Loop,
+                c: *xev.Completion,
+                r: FsEventError!FsEvent
+            ) xev.CallbackAction,
+        ) void {
+            _ = self;
+            _ = loop;
+            _ = c;
+            _ = userdata;
+            _ = cb;
+        }
+    };
+}
+
+pub fn KqueueFsEvents(comptime xev: type) type {
+    return struct {
+        pub const FsEventError = error {
+            Unexpected
+        };
+
+        pub const FsEvent = struct {
+            delete: bool = false,
+            write: bool = false,
+            extend: bool = false,
+            attrib: bool = false,
+            rename: bool = false,
+            revoke: bool = false,
+        };
+
+        const Self = @This();
+
+        fd: posix.fd_t,
+
+        pub fn init(path: []const u8) !Self {
+            const fd = try posix.open(
+                path,
+                .{
+                    .ACCMODE = .RDONLY,
+                },
+                0,
+            );
+            return .{ .fd = fd };
+        }
+
+        pub fn deinit(self: *Self) void {
+            posix.close(self.fd);
+        }
+
+        pub fn wait(
+            self: Self,
+            loop: *xev.Loop,
+            c: *xev.Completion,
+            comptime Userdata: type,
+            userdata: ?*Userdata,
+            comptime cb: *const fn (
+                ud: ?*Userdata,
+                l: *xev.Loop,
+                c: *xev.Completion,
+                r: FsEventError!FsEvent
+            ) xev.CallbackAction,
+        ) void {
+            loop.vnode(c, self.fd,
+                std.c.NOTE.ATTRIB |
+                std.c.NOTE.WRITE |
+                std.c.NOTE.RENAME |
+                std.c.NOTE.DELETE |
+                std.c.NOTE.EXTEND |
+                std.c.NOTE.REVOKE,
+                userdata, (struct {
+                fn callback(
+                    ud: ?*anyopaque,
+                    l_inner: *xev.Loop,
+                    c_inner: *xev.Completion,
+                    r: xev.Result,
+                ) xev.CallbackAction {
+                    const result: FsEventError!FsEvent = blk: {
+                        const fflags = r.vnode catch {
+                            break :blk FsEventError.Unexpected;
+                        };
+
+                        var events: FsEvent = .{};
+                        if (fflags & std.c.NOTE.DELETE != 0) events.delete = true;
+                        if (fflags & std.c.NOTE.WRITE != 0) events.write = true;
+                        if (fflags & std.c.NOTE.EXTEND != 0) events.extend = true;
+                        if (fflags & std.c.NOTE.ATTRIB != 0) events.attrib = true;
+                        if (fflags & std.c.NOTE.RENAME != 0) events.rename = true;
+                        if (fflags & std.c.NOTE.REVOKE != 0) events.revoke = true;
+
+                        break :blk events;
+                    };
+
+                    return @call(.always_inline, cb, .{
+                        common.userdataValue(Userdata, ud),
+                        l_inner,
+                        c_inner,
+                        result,
+                    });
+                }
+            }).callback);
+        }
+
+        test {
+            _ = FsEventsTests(xev, Self);
+
+        }
+    };
+}
+
+pub fn FsEventsDynamic(comptime xev: type) type {
+    _ = xev;
+    return struct {
+        const FsEventError = enum {
+            Unexpected
+        };
+        const FsEvent = enum {
+            change
+        };
+
+        const Self = @This();
+    };
+}
+
+fn FsEventsTests(comptime xev: type, comptime Impl: type) type {
+    return struct {
+        test "file events" {
+            const testing = std.testing;
+            testing.log_level = .debug;
+            const fs = std.fs;
+
+            const path = "kqueue_test_file";
+
+            var file = try fs.cwd().createFile(path, .{});
+            defer {
+                file.close();
+                fs.cwd().deleteFile(path) catch {};
+            }
+
+            var loop = try xev.Loop.init(.{});
+            defer loop.deinit();
+
+            var notifier = try Impl.init(path);
+            defer notifier.deinit();
+
+            const FsEventTest = struct {
+                count: u32,
+                event: Impl.FsEvent
+            };
+
+            var test_values =  FsEventTest{
+                .count = 0,
+                .event = undefined
+            };
+
+            var c_wait: xev.Completion = .{};
+
+            notifier.wait(&loop, &c_wait, FsEventTest, &test_values, (struct {
+                fn callback(
+                    ud: ?*FsEventTest,
+                    _: *xev.Loop,
+                    _: *xev.Completion,
+                    r: Impl.FsEventError!Impl.FsEvent,
+                ) xev.CallbackAction {
+                    const res = r catch unreachable;
+                    ud.?.*.count += 1;
+                    ud.?.*.event = res;
+
+                    return .rearm;
+                }
+            }).callback);
+
+            try loop.run(.no_wait);
+            try testing.expectEqual(test_values.count, 0);
+            try testing.expectEqual(test_values.event, undefined);
+
+            _ = try file.write("First event");
+            try loop.run(.no_wait);
+            try testing.expectEqual(test_values.count, 1);
+            try testing.expectEqual(test_values.event, Impl.FsEvent {
+                .write = true,
+                .extend = true,
+            });
+
+            try loop.run(.no_wait);
+            try testing.expectEqual(test_values.count, 1);
+            try testing.expectEqual(test_values.event, Impl.FsEvent {
+                .write = true,
+                .extend = true,
+            });
+
+            _ = try file.write("Second event");
+
+            try loop.run(.once);
+            try testing.expectEqual(test_values.count, 2);
+            try testing.expectEqual(test_values.event, Impl.FsEvent {
+                .write = true,
+                .extend = true,
+            });
+
+            const new_path = "new_test_file";
+
+            try fs.cwd().rename(path, new_path);
+            try fs.cwd().rename(new_path, path);
+
+            try loop.run(.once);
+            try testing.expectEqual(test_values.count, 3);
+            try testing.expectEqual(test_values.event, Impl.FsEvent {
+                .rename = true
+            });
+
+            try loop.run(.once);
+            try testing.expectEqual(test_values.count, 4);
+            try testing.expectEqual(test_values.event, Impl.FsEvent {
+                .attrib = true
+            });
+
+            try loop.run(.no_wait);
+            try testing.expectEqual(test_values.count, 4);
+            try testing.expectEqual(test_values.event, Impl.FsEvent {
+                .attrib = true
+            });
+        }
+    };
+}

@@ -64,6 +64,7 @@ pub fn Xev(comptime be: Backend, comptime T: type) type {
         pub const Timer = @import("watcher/timer.zig").Timer(Self);
         pub const TCP = @import("watcher/tcp.zig").TCP(Self);
         pub const UDP = @import("watcher/udp.zig").UDP(Self);
+        pub const FsEvent = @import("watcher/fsevents.zig").FsEvents(Self);
 
         /// The callback of the main Loop operations. Higher level interfaces may
         /// use a different callback mechanism.
