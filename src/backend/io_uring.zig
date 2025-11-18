@@ -41,8 +41,6 @@ pub const Loop = struct {
     /// Cached time
     cached_now: posix.timespec = undefined,
 
-    inotify_fd: ?posix.fd_t = null,
-
     flags: packed struct {
         /// True if the "now" field is outdated and should be updated
         /// when it is used.
@@ -79,43 +77,6 @@ pub const Loop = struct {
             posix.close(fd);
         }
         self.ring.deinit();
-    }
-
-    pub fn init_inotify(self: *Loop) !void {
-        if(self.inotify_fd) return;
-
-        self.inotify_fd = try posix.inotify_init1(posix.O{.CLOEXEC = true, .NONBLOCK = true});
-    }
-
-    pub fn add_inotify_mark(
-        self: *Loop,
-        path: []const u8
-    ) !i32 {
-        if(self.fanotify_fd) |fd| {
-            const mask = linux.IN.ATTRIB |
-                         linux.IN.CREATE |
-                         linux.IN.MODIFY |
-                         linux.IN.DELETE |
-                         linux.IN.DELETE_SELF |
-                         linux.IN.MOVE_SELF |
-                         linux.IN.MOVED_FROM |
-                         linux.IN.MOVED_TO;
-
-            return try posix.inotify_add_watch(fd, path, mask);
-        }
-
-        return error.Unexpected;
-    }
-
-    pub fn remove_inotify_mark(
-        self: *Loop,
-        wd: i32,
-    ) i32 {
-        if(self.fanotify_fd) |fd| {
-            posix.inotify_rm_watch(fd, wd);
-        }
-
-        return error.Unexpected;
     }
 
     /// Run the event loop. See RunMode documentation for details on modes.

@@ -29,14 +29,9 @@ pub fn InotifyFsEvents(comptime xev: type) type {
 
         const Self = @This();
 
-        wd: i32,
-
         pub fn init(path: []const u8) !Self {
-            try xev.init_inotify();
-
-            const wd = try xev.add_inotify_mark(path);
-
-            return .{ .wd = wd };
+            _ = path;
+            return .{};
         }
 
         pub fn deinit(self: *Self) void {
