@@ -86,6 +86,7 @@ pub fn Xev(comptime bes: []const AllBackend) type {
         pub const Timer = @import("watcher/timer.zig").Timer(Dynamic);
         pub const TCP = @import("watcher/tcp.zig").TCP(Dynamic);
         pub const UDP = @import("watcher/udp.zig").UDP(Dynamic);
+        pub const FsEvent = @import("watcher/fsevents.zig").FsEvents(Dynamic);
 
         /// The backend that is in use.
         pub var backend: Backend = subset(bes[bes.len - 1]);

@@ -222,16 +222,115 @@ pub fn KqueueFsEvents(comptime xev: type) type {
 }
 
 pub fn FsEventsDynamic(comptime xev: type) type {
-    _ = xev;
     return struct {
-        const FsEventError = enum {
-            Unexpected
-        };
-        const FsEvent = enum {
-            change
+        const Self = @This();
+
+        backend: Union,
+
+        pub const Union = xev.Union(&.{"FsEvents"});
+        pub const FsEventError = xev.ErrorSet(&.{"FsEvents", "FsEventError"});
+        pub const FsEvent = struct {
+            delete: bool = false,
+            write: bool = false,
+            extend: bool = false,
+            attrib: bool = false,
+            rename: bool = false,
+            revoke: bool = false,
         };
 
-        const Self = @This();
+        pub fn init(path: []const u8) !Self {
+            return .{ .backend = switch (xev.backend) {
+                inline else => |tag| backend: {
+                    const api = (comptime xev.superset(tag)).Api();
+                    break :backend @unionInit(
+                        Union,
+                        @tagName(tag),
+                        try api.FsEvents.init(path),
+                    );
+                },
+            } };
+        }
+
+        pub fn deinit(self: *Self) void {
+            switch (xev.backend) {
+                inline else => |tag| @field(
+                    self.backend,
+                    @tagName(tag),
+                ).deinit(),
+            }
+        }
+
+        pub fn wait(
+            self: Self,
+            loop: *xev.Loop,
+            c: *xev.Completion,
+            comptime Userdata: type,
+            userdata: ?*Userdata,
+            comptime cb: *const fn (
+                ud: ?*Userdata,
+                l: *xev.Loop,
+                c: *xev.Completion,
+                r: FsEventError!FsEvent,
+            ) xev.CallbackAction,
+        ) !void {
+            switch (xev.backend) {
+                inline else => |tag| {
+                    c.ensureTag(tag);
+
+                    const api = (comptime xev.superset(tag)).Api();
+                    const api_cb = (struct {
+                        fn callback(
+                            ud_inner: ?*Userdata,
+                            l_inner: *api.Loop,
+                            c_inner: *api.Completion,
+                            r_inner: api.FsEvents.FsEventError!api.FsEvents.FsEvent,
+                        ) xev.CallbackAction {
+                            return cb(
+                                ud_inner,
+                                @fieldParentPtr("backend", @as(
+                                    *xev.Loop.Union,
+                                    @fieldParentPtr(@tagName(tag), l_inner),
+                                )),
+                                @fieldParentPtr("value", @as(
+                                    *xev.Completion.Union,
+                                    @fieldParentPtr(@tagName(tag), c_inner),
+                                )),
+                                if (r_inner) |fs_event|
+                                    // Manually copy the fields of the FsEvent struct.
+                                    // This is necessary because `api.FsEvents.FsEvent`
+                                    // and `Self.FsEvent` are distinct types, even if
+                                    // structurally identical.
+                                    FsEvent{
+                                        .delete = fs_event.delete,
+                                        .write = fs_event.write,
+                                        .extend = fs_event.extend,
+                                        .attrib = fs_event.attrib,
+                                        .rename = fs_event.rename,
+                                        .revoke = fs_event.revoke,
+                                    }
+                                else |err|
+                                    err, // xev.ErrorSet handles backend-specific errors transparently
+                            );
+                        }
+                    }).callback;
+
+                    try @field(
+                        self.backend,
+                        @tagName(tag),
+                    ).wait(
+                        &@field(loop.backend, @tagName(tag)),
+                        &@field(c.value, @tagName(tag)),
+                        Userdata,
+                        userdata,
+                        api_cb,
+                    );
+                },
+            }
+        }
+
+        test {
+            _ = FsEventsTests(xev, Self);
+        }
     };
 }
 
