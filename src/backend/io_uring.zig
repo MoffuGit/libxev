@@ -4,6 +4,7 @@ const assert = std.debug.assert;
 const linux = std.os.linux;
 const posix = std.posix;
 const queue = @import("../queue.zig");
+const tree = @import("../tree.zig");
 const looppkg = @import("../loop.zig");
 const Callback = looppkg.Callback(@This());
 const CallbackAction = looppkg.CallbackAction;
@@ -41,6 +42,17 @@ pub const Loop = struct {
     /// Cached time
     cached_now: posix.timespec = undefined,
 
+    inotify_fd: ?posix.fd_t,
+
+    inotify_watchers: tree.Intrusive(IWatcher, void, (struct {
+        fn compare(ctx: void, a: *IWatcher, b: *IWatcher) std.math.Order {
+            _ = ctx;
+            if(a.wd < b.wd) return .lt;
+            if(a.wd > b.wd) return .gt;
+            return .eq;
+        }
+    }).compare) = .{ .context = {} },
+
     flags: packed struct {
         /// True if the "now" field is outdated and should be updated
         /// when it is used.
@@ -72,10 +84,245 @@ pub const Loop = struct {
         return result;
     }
 
+    pub fn init_inotify(self: *Loop) !void {
+        if (self.inotify_fd) return;
+        const fd = try posix.inotify_init1(posix.O{.NONBLOCK = true, .CLOEXEC = true});
+        self.inotify_fd = fd;
+
+        try self.start_inotify_poll();
+    }
+
+    pub fn start_watcher(self: *Loop, watcher: *IWatcher, c: *Completion) void {
+        watcher.watching.push(c);
+
+        if (watcher.c.state() == .dead) {
+            self.add(watcher.c);
+        }
+    }
+
+    pub fn start_inotify_poll(self: *Loop) !void {
+        const c: Completion = .{};
+        c.* = .{
+            .op = .{
+                .poll = .{
+                    .fd = self.inotify_fd.?,
+                    .events = posix.POLL.IN,
+                }
+            },
+
+            .userdata = undefined,
+            .callback = (struct {
+                fn callback(
+                    _: ?*anyopaque,
+                    l_inner: *Loop,
+                    c_inner: *Completion,
+                    r: Result,
+                ) CallbackAction {
+                    if (r.poll) |_| {
+                        var event_buf: [4096]u8 = undefined;
+
+                        // Read from the inotify file descriptor.
+                        const bytes_read = posix.read(c_inner.op.poll.fd, &event_buf) catch |err| {
+                          // If the read operation gets interrupted by a signal, retry.
+                          // If it's EAGAIN or EWOULDBLOCK, it means no data is currently available,
+                          // but the poll indicated readiness, which is unusual for io_uring poll.
+                          // For now, rearm if it's a transient error, disarm otherwise.
+                          if (err == error.SignalInterrupt or err == error.Again or err == error.WouldBlock) {
+                              return .rearm;
+                          }
+                          std.debug.print("inotify read error: {any}\n", .{err});
+                          return .disarm;
+                        };
+
+                        var current_offset: usize = 0;
+                        while (current_offset < bytes_read) {
+                          // Ensure there's enough space for at least the inotify_event struct.
+                          // A partial event would indicate a corrupted read or unexpected state.
+                          if (bytes_read - current_offset < @sizeOf(linux.inotify_event)) {
+                              std.debug.print("partial inotify event read, breaking loop\n", .{});
+                              break;
+                          }
+
+                          // Cast the current buffer slice to an inotify_event pointer.
+                          // The `name` field follows immediately after the struct data.
+                          const event_ptr: *linux.inotify_event = @ptrCast(&event_buf[current_offset]);
+                          const event = event_ptr.*;
+
+                          // Extract watch descriptor and mask.
+                          const wd = event.wd;
+                          const mask = event.mask;
+                          const name_len = event.len;
+
+                          // Find the corresponding watcher in the tree.
+                          // We need to construct a temporary IWatcher for the lookup as `find` takes a pointer.
+                          var search_watcher: IWatcher = .{
+                              .wd = wd,
+                          };
+                          if (l_inner.inotify_watchers.find(&search_watcher)) |watcher| {
+                              // Write the event mask to the watcher's eventfd.
+                              // eventfd expects an 8-byte unsigned integer. We'll write the mask as u64.
+                              const value_to_write: u64 = mask;
+                              _ = posix.write(watcher.fd, std.mem.asBytes(&value_to_write)) catch |write_err| {
+                                  // Log write error but continue processing other events.
+                                  // A write error here might indicate a closed eventfd or other issues.
+                                  std.debug.print("inotify watcher.fd write error for wd {d}: {any}\n", .{ wd, write_err });
+                              };
+                          } else {
+                              // Watcher not found for this wd. This can happen if a watch was removed
+                              // but an event for it was still pending in the inotify_fd.
+                              std.debug.print("inotify watcher not found for wd {d}\n", .{wd});
+                          }
+
+                          // Advance the offset to the next event.
+                          // Inotify events are typically padded to 4-byte boundaries after the name.
+                          const event_total_size = @sizeOf(linux.inotify_event) + name_len;
+                          const aligned_event_size = std.mem.alignForward(event_total_size, @alignOf(linux.inotify_event));
+
+                          current_offset += aligned_event_size;
+                        }
+
+                        return.rearm;
+                    } else {
+                        return .disarm;
+                    }
+                }
+            })
+        };
+
+        self.add(c);
+    }
+
+    pub fn deinit_inotify(self: *Loop) void {
+        if(self.inotify_fd) |fd| {
+            posix.close(fd);
+        }
+    }
+
+    pub fn inotify_add_watch(self: *Loop, path: []const u8) !i32 {
+        if(self.inotify_fd)|fd| {
+            try posix.inotify_add_watch(
+                fd,
+                path,
+                linux.IN.ATTRIB |
+                linux.IN.CREATE |
+                linux.IN.MODIFY |
+                linux.IN.DELETE |
+                linux.IN.DELETE_SELF |
+                linux.IN.MOVE_SELF |
+                linux.IN.MOVED_FROM |
+                linux.IN.MOVED_TO
+            );
+        }
+
+        return error.Unexpected;
+    }
+
+    pub fn get_inotify_watcher(self: *Loop, wd: i32) ?IWatcher {
+        var w: IWatcher = .{ .wd = wd };
+        return self.inotify_watchers.find(&w);
+    }
+
+    pub fn init_inotify_watcher(self: *Loop, wd: i32) !IWatcher {
+        const fd = try std.posix.eventfd(
+                        0,
+                        std.os.linux.EFD.CLOEXEC |
+                            std.os.linux.EFD.NONBLOCK,
+                    );
+
+        var new_watcher: IWatcher = .{
+            .wd = wd,
+            .watching = .{},
+            .fd = fd
+        };
+
+        new_watcher.*.c = .{
+            .op = .{
+                .poll = .{
+                    .fd = fd, // Poll on this watcher's eventfd
+                    .events = posix.POLL.IN,
+                },
+            },
+            .userdata = &new_watcher, // Pass the IWatcher itself as userdata
+            .callback = (struct {
+                fn callback(
+                    ud_inner: ?*anyopaque,
+                    l_inner: *Loop,
+                    c_inner: *Completion,
+                    r: Result,
+                ) CallbackAction {
+                    // Cast userdata back to *IWatcher
+                    const watcher = @as(*IWatcher, @ptrCast(@alignCast(ud_inner.?)));
+
+                    if (r.poll) |_| {
+                        var event_mask_u64: u64 = 0;
+                        const bytes_read = posix.read(c_inner.op.poll.fd, std.mem.asBytes(&event_mask_u64)) catch |err| {
+                            // If read fails for some reason, rearm to try again later.
+                            // If it's a permanent error, this will lead to repeated errors.
+                            // For now, assume rearm for transient errors.
+                            if (err == error.SignalInterrupt or err == error.Again or err == error.WouldBlock) {
+                                std.debug.print("inotify watcher eventfd read error (transient) for wd {d}: {any}\n", .{ watcher.wd, err });
+                                return .rearm;
+                            }
+                            std.debug.print("inotify watcher eventfd read error (disarming) for wd {d}: {any}\n", .{ watcher.wd, err });
+                            return .disarm;
+                        };
+
+                        if (bytes_read != @sizeOf(u64)) {
+                            std.debug.print("inotify watcher eventfd read unexpected bytes count for wd {d}: {d}\n", .{watcher.wd, bytes_read});
+                            // This indicates a problem, disarm for safety.
+                            return .disarm;
+                        }
+
+                        // The u64 read from eventfd is the u32 inotify event mask.
+                        // We cast it to u32, and then to i32 for `Completion.invoke`'s `res` parameter.
+                        // This relies on the completions in `watching` to be .read operations
+                        // that can interpret a positive i32 as a successful read of the mask.
+                        const inotify_mask_u32: u32 = @intCast(event_mask_u64);
+                        const invoke_res: i32 = @intCast(inotify_mask_u32);
+
+                        // Iterate through the watching queue and invoke callbacks.
+                        // We pop and re-push to handle rearming without modifying a list while iterating.
+                        var completions_to_process: queue.Intrusive(Completion) = .{};
+                        while (watcher.watching.pop()) |c_client| {
+                            completions_to_process.push(c_client);
+                        }
+
+                        while (completions_to_process.pop()) |c_client| {
+                            const action = c_client.invoke(l_inner, invoke_res);
+
+                            switch (action) {
+                                .rearm => watcher.watching.push(c_client), // Re-add to the end of the queue
+                                .disarm => {
+                                    // Completion is disarmed, it remains removed from the queue.
+                                }
+                            }
+                        }
+                        return .rearm; // Re-arm this eventfd poll
+                    } else {
+                        // Poll operation failed or was cancelled. Disarm the watcher eventfd poll.
+                        std.debug.print("inotify watcher eventfd poll error for wd {d}: {any}\n", .{watcher.wd, @tagName(r)});
+                        return .disarm;
+                    }
+                }
+            }).callback,
+        };
+
+        self.inotify_watchers.insert(&new_watcher);
+
+        return self.get_inotify_watcher(wd);
+    }
+
     pub fn deinit(self: *Loop) void {
         if (self.inotify_fd) |fd| {
             posix.close(fd);
         }
+
+        var tree_iter = self.inotify_watchers.iterator();
+
+        while(tree_iter.next())|wd| {
+            posix.close(wd.fd);
+        }
+
         self.ring.deinit();
     }
 
@@ -605,6 +852,13 @@ pub const Loop = struct {
     }
 };
 
+pub const IWatcher = struct {
+    wd: i32,
+    fd: posix.fd_t = undefined,
+    c: Completion = .{},
+    watching: queue.Intrusive(Completion) = .{},
+};
+
 /// A completion represents a single queued request in the ring.
 /// Completions must have stable pointers.
 ///
@@ -804,6 +1058,15 @@ pub const Completion = struct {
                     else => |errno| posix.unexpectedErrno(errno),
                 },
             },
+
+            .inotify_event => .{
+                .inotify_event = if (res >= 0)
+                    @intCast(res) // The res here *is* the u32 inotify mask
+                else switch (@as(posix.E, @enumFromInt(-res))) {
+                    .CANCELED => error.Canceled,
+                    else => |errno| posix.unexpectedErrno(errno),
+                },
+            },
         };
 
         return self.callback(self.userdata, loop, self, result);
@@ -888,6 +1151,9 @@ pub const OperationType = enum {
 
     /// Cancel an existing operation.
     cancel,
+
+    ///Inotify events
+    inotify
 };
 
 /// The result type based on the operation type. For a callback, the
@@ -910,6 +1176,7 @@ pub const Result = union(OperationType) {
     timer: TimerError!TimerTrigger,
     timer_remove: TimerRemoveError!void,
     cancel: CancelError!void,
+    inotify: InotifyEventError!u32
 };
 
 /// All the supported operations of this event loop. These are always
@@ -1011,6 +1278,8 @@ pub const Operation = union(OperationType) {
     cancel: struct {
         c: *Completion,
     },
+
+    inotify: struct {}
 };
 
 /// ReadBuffer are the various options for reading.
@@ -1047,6 +1316,11 @@ pub const WriteBuffer = union(enum) {
     },
 
     // TODO: future will have vectors
+};
+
+pub const InotifyEventError = error{
+    Canceled,
+    Unexpected,
 };
 
 pub const AcceptError = error{

@@ -29,13 +29,22 @@ pub fn InotifyFsEvents(comptime xev: type) type {
 
         const Self = @This();
 
+        path: [std.c.PATH_MAX]u8,
+        len: usize,
+
         pub fn init(path: []const u8) !Self {
-            _ = path;
-            return .{};
+            var res = Self {
+                .path = undefined,
+                .len = path.len,
+            };
+
+            @memcpy(res.path[0..path.len], path);
+
+            return res;
         }
 
         pub fn deinit(self: *Self) void {
-            xev.remove_inotify_mark(self.wd);
+            _ = self;
         }
 
         pub fn wait(
@@ -50,12 +59,59 @@ pub fn InotifyFsEvents(comptime xev: type) type {
                 c: *xev.Completion,
                 r: FsEventError!FsEvent
             ) xev.CallbackAction,
-        ) void {
-            _ = self;
-            _ = loop;
-            _ = c;
-            _ = userdata;
-            _ = cb;
+        ) !void {
+            try loop.init_inotify();
+
+            const wd = try loop.inotify_add_watch(self.path);
+
+            const w = if (loop.get_inotify_watcher(wd)) |existing_watcher|
+              existing_watcher
+            else blk: {
+              break :blk try loop.init_inotify_watcher(wd);
+            };
+
+            c.* = .{
+                .op = .{ .inotify = {} },
+                .userdata = common.userdataValue(Userdata, userdata),
+                .callback = (struct {
+                    fn callback(
+                        ud_inner: ?*anyopaque,
+                        l_inner: *xev.Loop,
+                        c_inner: *xev.Completion,
+                        r: xev.Result,
+                    ) xev.CallbackAction {
+                        const result: FsEventError!FsEvent = blk: {
+                            const mask_u32 = r.inotify_event catch |err| {
+                                std.debug.print("inotify_event error: {any}\n", .{err});
+                                break :blk FsEventError.Unexpected;
+                            };
+
+                            var events: FsEvent = .{};
+                            // Map inotify masks to FsEvent fields
+                            if (mask_u32 & posix.IN.ATTRIB != 0) events.attrib = true;
+                            if (mask_u32 & posix.IN.CREATE != 0) events.write = true;
+                            if (mask_u32 & posix.IN.MODIFY != 0) events.write = true;
+                            if (mask_u32 & posix.IN.DELETE != 0) events.delete = true;
+                            if (mask_u32 & posix.IN.DELETE_SELF != 0) events.delete = true;
+                            if (mask_u32 & posix.IN.MOVE_SELF != 0) events.rename = true;
+                            if (mask_u32 & posix.IN.MOVED_FROM != 0) events.rename = true;
+                            if (mask_u32 & posix.IN.MOVED_TO != 0) events.rename = true;
+                            // Other inotify flags can be added as needed
+
+                            break :blk events;
+                        };
+
+                        return @call(.always_inline, cb, .{
+                            @as(?Userdata, @ptrCast(@alignCast(ud_inner))),
+                            l_inner,
+                            c_inner,
+                            result,
+                        });
+                    }
+                }).callback,
+            };
+
+            loop.start_watcher(w, c);
         }
     };
 }
@@ -78,6 +134,8 @@ pub fn KqueueFsEvents(comptime xev: type) type {
         const Self = @This();
 
         fd: posix.fd_t,
+        path: [std.c.PATH_MAX]u8,
+        len: usize,
 
         pub fn init(path: []const u8) !Self {
             const fd = try posix.open(
@@ -87,7 +145,16 @@ pub fn KqueueFsEvents(comptime xev: type) type {
                 },
                 0,
             );
-            return .{ .fd = fd };
+
+            var res = Self {
+                .fd = fd,
+                .path = undefined,
+                .len = path.len
+            };
+
+            @memcpy(res.path[0..path.len], path);
+
+            return res;
         }
 
         pub fn deinit(self: *Self) void {
@@ -106,7 +173,7 @@ pub fn KqueueFsEvents(comptime xev: type) type {
                 c: *xev.Completion,
                 r: FsEventError!FsEvent
             ) xev.CallbackAction,
-        ) void {
+        ) !void {
             loop.vnode(c, self.fd,
                 std.c.NOTE.ATTRIB |
                 std.c.NOTE.WRITE |
@@ -201,7 +268,7 @@ fn FsEventsTests(comptime xev: type, comptime Impl: type) type {
 
             var c_wait: xev.Completion = .{};
 
-            notifier.wait(&loop, &c_wait, FsEventTest, &test_values, (struct {
+            try notifier.wait(&loop, &c_wait, FsEventTest, &test_values, (struct {
                 fn callback(
                     ud: ?*FsEventTest,
                     _: *xev.Loop,
