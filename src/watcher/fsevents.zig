@@ -12,6 +12,12 @@ pub fn FsEvents(comptime xev: type) type {
     };
 }
 
+//WARN:
+//this thing don't remove the callbacks from the IWatcher,
+//that mean that every cb that gets added will never be removed
+//and that means that every IWatcher will ever exist,
+//that's like bad, but right now i don't even have where to test this thing :(
+//i need to redo my vm but i don't want to :(
 pub fn InotifyFsEvents(comptime xev: type) type {
     return struct {
         const FsEventError = enum {
