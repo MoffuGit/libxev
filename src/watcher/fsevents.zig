@@ -122,6 +122,12 @@ pub fn InotifyFsEvents(comptime xev: type) type {
     };
 }
 
+//NOTE:
+//it look like i will FSEvents for apple systems
+//I'm not sure how to integrate it into this system but is the
+//best option when you need to watch a directory,
+//if not you are kinda stuck to always receive write notifications
+
 pub fn KqueueFsEvents(comptime xev: type) type {
     return struct {
         pub const FsEventError = error {
