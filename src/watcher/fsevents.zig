@@ -146,16 +146,15 @@ pub fn KqueueFsEvents(comptime xev: type) type {
         pub fn init(path: []const u8) !Self {
             const fd = try posix.open(
                 path,
-                .{
-                    .ACCMODE = .RDONLY,
-                },
+                .{ .EVTONLY = true },
                 0,
             );
 
+
             var res = Self {
-                .fd = fd,
-                .path = undefined,
-                .len = path.len
+              .fd = fd,
+              .path = undefined,
+              .len = path.len
             };
 
             @memcpy(res.path[0..path.len], path);
@@ -438,6 +437,94 @@ fn FsEventsTests(comptime xev: type, comptime Impl: type) type {
             try testing.expectEqual(test_values.event, Impl.FsEvent {
                 .attrib = true
             });
+        }
+
+        test "directory events" {
+            const testing = std.testing;
+            testing.log_level = .debug;
+            const fs = std.fs;
+            const Allocator = std.testing.allocator;
+
+            const dir_path = "test_watch_dir_events";
+            const file_in_dir_path = "test_watch_dir_events/test_file.txt";
+            const renamed_file_in_dir_path = "test_watch_dir_events/renamed_test_file.txt";
+            const sub_dir_path = "test_watch_dir_events/sub_dir";
+
+            // Setup temporary directory
+            try fs.cwd().makeDir(dir_path);
+            defer fs.cwd().deleteTree(dir_path) catch {}; // Clean up recursively
+
+            var loop = try xev.Loop.init(.{});
+            defer loop.deinit();
+
+            var notifier = try Impl.init(dir_path);
+            defer notifier.deinit();
+
+            const FsEventTest = struct {
+                count: u32,
+                events: std.ArrayList(Impl.FsEvent), // Use ArrayList to capture all events
+            };
+
+            var test_values = FsEventTest{
+                .count = 0,
+                .events = try std.ArrayList(Impl.FsEvent).initCapacity(Allocator, 0),
+            };
+            defer {
+                test_values.events.deinit(Allocator);
+            }
+
+            var c_wait: xev.Completion = .{};
+
+            try notifier.wait(&loop, &c_wait, FsEventTest, &test_values, (struct {
+                fn callback(
+                    ud: ?*FsEventTest,
+                    _: *xev.Loop,
+                    _: *xev.Completion,
+                    r: Impl.FsEventError!Impl.FsEvent,
+                ) xev.CallbackAction {
+                    const res = r catch unreachable;
+                    ud.?.*.count += 1;
+                    ud.?.*.events.append(Allocator, res) catch {
+                        unreachable;
+                    }; // Store all events
+                    return .rearm;
+                }
+            }).callback);
+
+            // Initial state: No events should be pending
+            try loop.run(.no_wait);
+            try testing.expectEqual(test_values.count, 0);
+
+            // 1. Create a file in the directory
+            var file = try fs.cwd().createFile(file_in_dir_path, .{});
+            file.close();
+            try loop.run(.no_wait); // Process one event
+            try testing.expectEqual(test_values.events.items[0], Impl.FsEvent{.write = true});
+            try testing.expectEqual(test_values.count, 1);
+
+            // 3. Rename file within the directory
+            try fs.cwd().rename(file_in_dir_path, renamed_file_in_dir_path);
+            try loop.run(.no_wait); // Process one event
+            try testing.expectEqual(test_values.count, 2);
+            try testing.expectEqual(test_values.events.items[1], Impl.FsEvent{.write = true});
+
+            // 4. Delete the file
+            try fs.cwd().deleteFile(renamed_file_in_dir_path);
+            try loop.run(.no_wait); // Process one event
+            try testing.expectEqual(test_values.count, 3);
+            try testing.expectEqual(test_values.events.items[2], Impl.FsEvent{.write = true});
+
+            // 5. Create a subdirectory
+            try fs.cwd().makeDir(sub_dir_path);
+            try loop.run(.no_wait); // Process one event
+            try testing.expectEqual(test_values.count, 4);
+            try testing.expectEqual(test_values.events.items[3], Impl.FsEvent{.write = true});
+
+            // 6. Delete the subdirectory
+            try fs.cwd().deleteDir(sub_dir_path) ; // Ensure recursive delete
+            try loop.run(.no_wait); // Process one event
+            try testing.expectEqual(test_values.count, 5);
+            try testing.expectEqual(test_values.events.items[4], Impl.FsEvent{.write = true});
         }
     };
 }
