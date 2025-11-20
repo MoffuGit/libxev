@@ -12,6 +12,11 @@ pub fn FsEvents(comptime xev: type) type {
     };
 }
 
+//NOTE:
+//probably every event should return the path to what the event corresponse
+//why?, because it will make every thing easier for the user to now what file change and why
+//this is more important on directory watchers
+
 //WARN:
 //this thing don't remove the callbacks from the IWatcher,
 //that mean that every cb that gets added will never be removed
