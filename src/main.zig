@@ -38,6 +38,7 @@ pub const Stream = stream.GenericStream;
 pub const Timer = xev.Timer;
 pub const TCP = xev.TCP;
 pub const UDP = xev.UDP;
+pub const FileSystem = xev.FileSystem;
 
 comptime {
     // This ensures that all the public decls from the API are forwarded
@@ -95,6 +96,9 @@ test {
     _ = @import("heap.zig");
     _ = @import("queue.zig");
     _ = @import("queue_mpsc.zig");
+    _ = @import("tree.zig");
+    _ = @import("pool.zig");
+    _ = @import("queue_double.zig");
     _ = ThreadPool;
     _ = Dynamic;
 
