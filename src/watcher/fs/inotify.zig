@@ -13,6 +13,8 @@ const log = std.log.scoped(.fs);
 
 const WatcherPool = pool.Intrusive(FileWatcher);
 
+const CAPACITY = 100;
+
 fn compare(a: *FileWatcher, b: *FileWatcher) std.math.Order {
     if (a.wd > b.wd) return .gt;
     if (a.wd < b.wd) return .lt;
@@ -21,27 +23,29 @@ fn compare(a: *FileWatcher, b: *FileWatcher) std.math.Order {
 
 pub fn FileSystem(comptime xev: type) type {
     return struct {
-        fd: posix.fd_t,
+        fd: posix.fd_t = -1,
         c: xev.Completion = .{},
+        buffer: [CAPACITY]FileWatcher = undefined,
 
-        pool: WatcherPool,
-        tree: tree.Intrusive(FileWatcher, compare),
-
-        flags: packed struct { init: bool = false } = .{},
+        pool: WatcherPool = undefined,
+        tree: tree.Intrusive(FileWatcher, compare) = .{},
 
         const Self = @This();
 
-        pub fn init(buffer: []FileWatcher) !Self {
-            const fd = try posix.inotify_init1(linux.IN.NONBLOCK | linux.IN.CLOEXEC);
-
-            return .{ .fd = fd, .pool = WatcherPool.init(buffer), .tree = .{} };
+        pub fn init() !Self {
+            return .{};
         }
 
-        pub fn start(self: *Self, loop: *xev.Loop) void {
-            if (self.flags.init) {
+        pub fn start(self: *Self, loop: *xev.Loop) !void {
+            if (self.fd != -1) {
                 return;
             }
-            defer self.flags.init = true;
+
+            const fd = try posix.inotify_init1(linux.IN.NONBLOCK | linux.IN.CLOEXEC);
+
+            self.fd = fd;
+
+            self.pool = WatcherPool.init(&self.buffer);
 
             const events: u32 = comptime switch (xev.backend) {
                 .io_uring => posix.POLL.IN,
@@ -115,7 +119,7 @@ pub fn FileSystem(comptime xev: type) type {
         }
 
         pub fn watch(self: *Self, loop: *xev.Loop, path: []const u8, c: *Completion) !void {
-            self.start(loop);
+            try self.start(loop);
 
             const wd = try posix.inotify_add_watch(self.fd, path, linux.IN.ATTRIB |
                 linux.IN.CREATE |
@@ -216,9 +220,7 @@ pub fn FileSystemTest(comptime xev: type) type {
             var loop = try xev.Loop.init(.{});
             defer loop.deinit();
 
-            var buffer: [10]FileWatcher = undefined;
-            var fs = try FS.init(&buffer);
-
+            var fs = try FS.init();
             defer fs.deinit();
 
             // Test Case 1: Watch a single path with multiple completions
@@ -267,7 +269,7 @@ pub fn FileSystemTest(comptime xev: type) type {
             try fs.watch(&loop, path5, &comp5_2);
             try fs.watch(&loop, path5, &comp5_3);
 
-            try testing.expectEqual(fs.pool.countFree(), 5);
+            try testing.expectEqual(fs.pool.countFree(), 95);
 
             fs.cancel(&comp4_1);
             fs.cancel(&comp4_2);
@@ -275,15 +277,14 @@ pub fn FileSystemTest(comptime xev: type) type {
             fs.cancel(&comp5_2);
             fs.cancel(&comp5_3);
 
-            try testing.expectEqual(fs.pool.countFree(), 7);
+            try testing.expectEqual(fs.pool.countFree(), 97);
         }
 
         test "test inotify polling" {
             var loop = try xev.Loop.init(.{});
             defer loop.deinit();
 
-            var buffer: [10]FileWatcher = undefined;
-            var fs = try FS.init(&buffer);
+            var fs = try FS.init();
             defer fs.deinit();
 
             _ = try loop.run(.no_wait);

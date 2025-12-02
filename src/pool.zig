@@ -3,19 +3,18 @@ const std = @import("std");
 pub fn Intrusive(comptime T: type) type {
     return struct {
         const Self = @This();
-        buffer: []T,
         head: ?*T = null,
 
         pub fn init(buffer: []T) Self {
-            var self: Self = .{ .buffer = buffer };
-
             if (buffer.len == 0) {
-                return self;
+                return .{};
             }
+
+            var self: Self = .{};
 
             var i: usize = 0;
             while (i < buffer.len) : (i += 1) {
-                var t = &self.buffer[i];
+                var t = &buffer[i];
                 t.next = self.head;
                 self.head = t;
             }
@@ -32,7 +31,6 @@ pub fn Intrusive(comptime T: type) type {
         }
 
         pub fn free(self: *Self, t: *T) void {
-            // Assuming T has a .next field
             t.next = self.head;
             self.head = t;
         }
