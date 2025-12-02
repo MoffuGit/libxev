@@ -23,7 +23,6 @@ pub fn FileSystem(comptime xev: type) type {
     return struct {
         fd: posix.fd_t,
         c: xev.Completion = .{},
-        buffer: [10]FileWatcher = undefined,
 
         pool: WatcherPool,
         tree: tree.Intrusive(FileWatcher, compare),
@@ -32,10 +31,10 @@ pub fn FileSystem(comptime xev: type) type {
 
         const Self = @This();
 
-        pub fn init() !Self {
+        pub fn init(buffer: []FileWatcher) !Self {
             const fd = try posix.inotify_init1(linux.IN.NONBLOCK | linux.IN.CLOEXEC);
 
-            return .{ .fd = fd, .pool = undefined, .tree = .{} };
+            return .{ .fd = fd, .pool = WatcherPool.init(buffer), .tree = .{} };
         }
 
         pub fn start(self: *Self, loop: *xev.Loop) void {
@@ -43,8 +42,6 @@ pub fn FileSystem(comptime xev: type) type {
                 return;
             }
             defer self.flags.init = true;
-
-            self.pool = WatcherPool.init(&self.buffer);
 
             const events: u32 = comptime switch (xev.backend) {
                 .io_uring => posix.POLL.IN,
@@ -219,7 +216,8 @@ pub fn FileSystemTest(comptime xev: type) type {
             var loop = try xev.Loop.init(.{});
             defer loop.deinit();
 
-            var fs = try FS.init();
+            var buffer: [10]FileWatcher = undefined;
+            var fs = try FS.init(&buffer);
 
             defer fs.deinit();
 
@@ -284,7 +282,8 @@ pub fn FileSystemTest(comptime xev: type) type {
             var loop = try xev.Loop.init(.{});
             defer loop.deinit();
 
-            var fs = try FS.init();
+            var buffer: [10]FileWatcher = undefined;
+            var fs = try FS.init(&buffer);
             defer fs.deinit();
 
             _ = try loop.run(.no_wait);
