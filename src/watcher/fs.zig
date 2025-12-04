@@ -1,4 +1,5 @@
 const inotify = @import("fs/inotify.zig");
+const kqueue = @import("fs/kqueue.zig");
 const std = @import("std");
 
 pub fn FileSystem(comptime xev: type) type {
@@ -7,6 +8,7 @@ pub fn FileSystem(comptime xev: type) type {
         .io_uring,
         .epoll,
         => inotify.FileSystem(xev),
+        .kqueue => kqueue.FileSystem(xev),
         else => unreachable,
     };
 }

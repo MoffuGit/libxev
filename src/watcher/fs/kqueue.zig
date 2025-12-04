@@ -11,24 +11,39 @@ const CompletionState = fspkg.CompletionState;
 const NoopCallback = fspkg.NoopCallback(@This());
 const log = std.log.scoped(.fs);
 
-const WatcherPool = pool.Intrusive(FileWatcher);
 
 const CAPACITY = 100;
+const BASIS: u32 = 0x811c9dc5;
+const PRIME: u32 = 0x1000193;
 
-fn compare(a: *FileWatcher, b: *FileWatcher) std.math.Order {
-    if (a.wd > b.wd) return .gt;
-    if (a.wd < b.wd) return .lt;
-    return .eq;
+fn hash(bytes: []const u8) u32 {
+    var h = BASIS;
+
+    for (bytes) |byte| {
+        h = h ^ @as(u32, byte);
+        h = h *% PRIME;
+    }
+    return h;
 }
 
 pub fn FileSystem(comptime xev: type) type {
+    const WatcherPool = pool.Intrusive(FileWatcher(xev));
+
+
     return struct {
-        fd: posix.fd_t = -1,
-        c: xev.Completion = .{},
-        buffer: [CAPACITY]FileWatcher = undefined,
+        fn compare(a: *FileWatcher(xev), b: *FileWatcher(xev)) std.math.Order {
+            if (a.hash > b.hash) return .gt;
+            if (a.hash < b.hash) return .lt;
+            return .eq;
+        }
+
+        buffer: [CAPACITY]FileWatcher(xev) = undefined,
 
         pool: WatcherPool = undefined,
-        tree: tree.Intrusive(FileWatcher, compare) = .{},
+        tree: tree.Intrusive(FileWatcher(xev), compare) = .{},
+        flags: packed struct {
+            init: bool =false,
+        } = .{},
 
         const Self = @This();
 
@@ -36,119 +51,62 @@ pub fn FileSystem(comptime xev: type) type {
             return .{};
         }
 
-        pub fn start(self: *Self, loop: *xev.Loop) !void {
-            if (self.fd != -1) {
+        pub fn start(self: *Self) void {
+            if (self.flags.init) {
                 return;
             }
-
-            const fd = try posix.inotify_init1(linux.IN.NONBLOCK | linux.IN.CLOEXEC);
-
-            self.fd = fd;
-
-            self.pool = WatcherPool.init(&self.buffer);
-
-            const events: u32 = comptime switch (xev.backend) {
-                .io_uring => posix.POLL.IN,
-                .epoll => linux.EPOLL.IN,
-                else => unreachable,
-            };
-
-            self.c = .{ .op = .{ .poll = .{
-                .fd = self.fd,
-                .events = events,
-            } }, .userdata = self, .callback = poll_callback };
-
-            loop.add(&self.c);
+                self.pool = WatcherPool.init(&self.buffer);
+            self.flags.init = true;
         }
 
         pub fn deinit(self: *Self) void {
-            //WARN:
-            //i need to cancel the poll completion
-            // self.loop.cancel(self.c);
-            posix.close(self.fd);
-        }
-
-        pub fn poll_callback(ud: ?*anyopaque, _: *xev.Loop, poll_c: *xev.Completion, res: xev.Result) xev.CallbackAction {
-            const self: *Self = @ptrCast(@alignCast(ud.?));
-            if (res.poll) |_| {
-                var buffer: [4096]u8 = undefined;
-                while (true) {
-                    const bytes_read = posix.read(poll_c.op.poll.fd, &buffer) catch |err| {
-                        if (err == error.WouldBlock or err == error.Intr) {
-                            break;
-                        }
-                        log.err("inotify read error: {}", .{err});
-                        break;
-                    };
-
-                    if (bytes_read == 0) {
-                        break;
-                    }
-
-                    var offset: usize = 0;
-                    while (offset < bytes_read) {
-                        const event_ptr: *const linux.inotify_event = @ptrCast(@alignCast(&buffer[offset]));
-                        const event = event_ptr.*;
-
-                        var temp_wd = FileWatcher{ .wd = event.wd };
-                        if (self.tree.find(&temp_wd)) |watcher| {
-                            var current = watcher.completions;
-                            watcher.completions = .{};
-
-                            while (current.pop()) |c| {
-                                if (c.invoke(event.mask) == .rearm) {
-                                    watcher.completions.push(c);
-                                } else {
-                                    c.*.flags.state = .dead;
-                                }
-                            }
-                        } else {
-                            // Watcher not found. This can happen if a watch was removed but events were
-                            // still pending in the kernel buffer, or due to race conditions.
-                            log.warn("inotify event for unknown wd: {}", .{event.wd});
-                        }
-
-                        // Advance to the next event in the buffer.
-                        // event.len is the size of the filename string that follows the struct.
-                        offset += @sizeOf(linux.inotify_event) + event.len;
-                    }
-                }
-                return .rearm;
-            } else |err| {
-                log.debug("error poll {}", .{err});
-                return .disarm;
+            if (!self.flags.init) {
+                return;
             }
+
+            //WARN:
+            //i need to cancel and close every fd
+            // var curr = self.pool.head;
+            // while(curr) |w| {
+            //     posix.close(w.fd);
+            //     curr = w.next;
+            // }
         }
 
         pub fn watch(self: *Self, loop: *xev.Loop, path: []const u8, c: *Completion) !void {
-            try self.start(loop);
+            self.start();
 
-            const wd = try posix.inotify_add_watch(self.fd, path, linux.IN.ATTRIB |
-                linux.IN.CREATE |
-                linux.IN.MODIFY |
-                linux.IN.DELETE |
-                linux.IN.DELETE_SELF |
-                linux.IN.MOVE_SELF |
-                linux.IN.MOVED_FROM |
-                linux.IN.MOVED_TO);
-
-            var temp_wd = FileWatcher{ .wd = wd };
-
-            if (self.tree.find(&temp_wd)) |w| {
+            var temp: FileWatcher(xev) = .{.hash = hash(path)};
+            if(self.tree.find(&temp))|w| {
                 w.completions.push(c);
-            } else {
-                const w = try self.pool.alloc();
-                w.* = .{ .wd = wd };
+            }else {
+                var w = try self.pool.alloc();
+                w.fd = try posix.open(path, posix.O{}, 0);
+                w.hash = temp.hash;
+
+                w.c = .{
+                    .op = .{
+                        .vnode = .{
+                            .fd = w.fd,
+                            // Flags for various file system changes
+                            .flags = std.c.NOTE.WRITE | std.c.NOTE.DELETE | std.c.NOTE.ATTRIB | std.c.NOTE.EXTEND | std.c.NOTE.LINK | std.c.NOTE.RENAME,
+                        },
+                    },
+                    .userdata = w,
+                    .callback = vnode_callback,
+                };
+                 loop.add(&w.c); // Add the kqueue vnode event to the main loop
+
+                self.tree.insert(w); // Add the FileWatcher to our tree
                 w.completions.push(c);
-                self.tree.insert(w);
             }
 
-            c.*.flags.state = .active;
-            c.*.wd = wd;
+            c.hash = temp.hash;
+            c.flags.state = .active;
         }
 
         pub fn cancel(self: *Self, c: *Completion) void {
-            var temp_wd = FileWatcher{ .wd = c.wd };
+            var temp_wd = FileWatcher(xev) { .hash = c.hash };
 
             if (self.tree.find(&temp_wd)) |watcher| {
                 watcher.completions.remove(c);
@@ -158,9 +116,46 @@ pub fn FileSystem(comptime xev: type) type {
                 if (watcher.completions.empty()) {
                     _ = self.tree.remove(watcher);
                     self.pool.free(watcher);
-                    posix.inotify_rm_watch(self.fd, c.wd);
+                    //NOTE:
+                    //i would need to cancel the completion from the loop
                 }
             }
+        }
+
+        fn vnode_callback(
+            ud: ?*anyopaque,
+            _: *xev.Loop,
+            _: *xev.Completion, // The xev.Completion for this vnode watcher
+            result: xev.Result,
+        ) xev.CallbackAction {
+            const watcher: *FileWatcher(xev) = @ptrCast(@alignCast(ud.?));
+            const vnode_flags = result.vnode catch |err| {
+                log.err("Vnode event error for fd {}: {any}", .{watcher.fd, err});
+                // If there's an error on the vnode watcher itself, disarm it.
+                // All user completions for this watcher will effectively stop receiving events.
+                return .disarm;
+            };
+
+            // Temporarily move completions out to process them.
+            // This allows safe modification of the completions queue during iteration.
+            var temp_queue = watcher.completions;
+            watcher.completions = .{};
+
+            var current = temp_queue.pop();
+            while (current) |comp| {
+                const action = comp.invoke(vnode_flags);
+                switch (action) {
+                    .disarm => {
+                        comp.flags.state = .dead;
+                    },
+                    .rearm => {
+                        watcher.completions.push(comp);
+                    },
+                }
+                current = temp_queue.pop();
+            }
+
+            return .rearm;
         }
 
         test {
@@ -169,15 +164,23 @@ pub fn FileSystem(comptime xev: type) type {
     };
 }
 
-pub const FileWatcher = struct {
-    const Self = @This();
+pub fn FileWatcher(comptime xev: type) type {
+    return struct {
+        const Self = @This();
 
-    wd: i32,
+        //shared file descriptor
+        fd: i32 = -1,
+        c: xev.Completion = .{},
 
-    next: ?*Self = null,
-    rb_node: tree.IntrusiveField(Self) = .{},
-    completions: double.Intrusive(Completion) = .{},
-};
+        //hashed path
+        hash: u32,
+
+        next: ?*Self = null,
+        rb_node: tree.IntrusiveField(Self) = .{},
+        completions: double.Intrusive(Completion) = .{},
+
+    };
+}
 
 pub const Completion = struct {
     next: ?*Completion = null,
@@ -187,7 +190,7 @@ pub const Completion = struct {
 
     callback: Callback = NoopCallback,
 
-    wd: i32 = -1,
+    hash: u32 = 0,
 
     flags: packed struct {
         state: State = .dead,
@@ -311,11 +314,12 @@ pub fn FileSystemTest(comptime xev: type) type {
 
             try fs.watch(&loop, path1, &comp);
 
+            _ = try loop.run(.no_wait);
+
             _ = try file.write("hello");
             try file.sync();
 
-            // Run the event loop to process the inotify event
-            _ = try loop.run(.no_wait);
+            _ = try loop.run(.once);
 
             // Assert that the callback was invoked
             try testing.expectEqual(counter, 1);
