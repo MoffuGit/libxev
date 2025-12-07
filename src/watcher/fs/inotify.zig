@@ -5,30 +5,25 @@ const double = @import("../../queue_double.zig");
 const tree = @import("../../tree.zig");
 const pool = @import("../../pool.zig");
 const fspkg = @import("../fs.zig");
-const Callback = fspkg.Callback(@This());
+const Callback = fspkg.Callback();
 const CallbackAction = fspkg.CallbackAction;
 const CompletionState = fspkg.CompletionState;
-const NoopCallback = fspkg.NoopCallback(@This());
+const Completion = fspkg.Completion;
+const NoopCallback = fspkg.NoopCallback();
 const log = std.log.scoped(.fs);
-
-const WatcherPool = pool.Intrusive(FileWatcher);
 
 const CAPACITY = 100;
 
-fn compare(a: *FileWatcher, b: *FileWatcher) std.math.Order {
-    if (a.wd > b.wd) return .gt;
-    if (a.wd < b.wd) return .lt;
-    return .eq;
-}
-
 pub fn FileSystem(comptime xev: type) type {
+    const FileWatcher = fspkg.FileWatcher(xev);
+    const Pool = pool.Intrusive(FileWatcher);
     return struct {
         fd: posix.fd_t = -1,
         c: xev.Completion = .{},
         buffer: [CAPACITY]FileWatcher = undefined,
 
-        pool: WatcherPool = undefined,
-        tree: tree.Intrusive(FileWatcher, compare) = .{},
+        pool: Pool = undefined,
+        tree: tree.Intrusive(FileWatcher, FileWatcher.compare) = .{},
 
         const Self = @This();
 
@@ -45,7 +40,7 @@ pub fn FileSystem(comptime xev: type) type {
 
             self.fd = fd;
 
-            self.pool = WatcherPool.init(&self.buffer);
+            self.pool = Pool.init(&self.buffer);
 
             const events: u32 = comptime switch (xev.backend) {
                 .io_uring => posix.POLL.IN,
@@ -62,10 +57,11 @@ pub fn FileSystem(comptime xev: type) type {
         }
 
         pub fn deinit(self: *Self) void {
+            _ = self;
             //WARN:
             //i need to cancel the poll completion
             // self.loop.cancel(self.c);
-            posix.close(self.fd);
+            // posix.close(self.fd);
         }
 
         pub fn poll_callback(ud: ?*anyopaque, _: *xev.Loop, poll_c: *xev.Completion, res: xev.Result) xev.CallbackAction {
@@ -90,7 +86,7 @@ pub fn FileSystem(comptime xev: type) type {
                         const event_ptr: *const linux.inotify_event = @ptrCast(@alignCast(&buffer[offset]));
                         const event = event_ptr.*;
 
-                        var temp_wd = FileWatcher{ .wd = event.wd };
+                        var temp_wd = FileWatcher{ .wd = @intCast(event.wd) };
                         if (self.tree.find(&temp_wd)) |watcher| {
                             var current = watcher.completions;
                             watcher.completions = .{};
@@ -123,14 +119,14 @@ pub fn FileSystem(comptime xev: type) type {
         pub fn watch(self: *Self, loop: *xev.Loop, path: []const u8, c: *Completion) !void {
             try self.start(loop);
 
-            const wd = try posix.inotify_add_watch(self.fd, path, linux.IN.ATTRIB |
+            const wd: u32 = @intCast(try posix.inotify_add_watch(self.fd, path, linux.IN.ATTRIB |
                 linux.IN.CREATE |
                 linux.IN.MODIFY |
                 linux.IN.DELETE |
                 linux.IN.DELETE_SELF |
                 linux.IN.MOVE_SELF |
                 linux.IN.MOVED_FROM |
-                linux.IN.MOVED_TO);
+                linux.IN.MOVED_TO));
 
             var temp_wd = FileWatcher{ .wd = wd };
 
@@ -148,7 +144,7 @@ pub fn FileSystem(comptime xev: type) type {
         }
 
         pub fn cancel(self: *Self, c: *Completion) void {
-            var temp_wd = FileWatcher{ .wd = c.wd };
+            var temp_wd = FileWatcher{ .wd = @intCast(c.wd) };
 
             if (self.tree.find(&temp_wd)) |watcher| {
                 watcher.completions.remove(c);
@@ -158,7 +154,7 @@ pub fn FileSystem(comptime xev: type) type {
                 if (watcher.completions.empty()) {
                     _ = self.tree.remove(watcher);
                     self.pool.free(watcher);
-                    posix.inotify_rm_watch(self.fd, c.wd);
+                    posix.inotify_rm_watch(self.fd, @intCast(c.wd));
                 }
             }
         }
@@ -168,48 +164,6 @@ pub fn FileSystem(comptime xev: type) type {
         }
     };
 }
-
-pub const FileWatcher = struct {
-    const Self = @This();
-
-    wd: i32,
-
-    next: ?*Self = null,
-    rb_node: tree.IntrusiveField(Self) = .{},
-    completions: double.Intrusive(Completion) = .{},
-};
-
-pub const Completion = struct {
-    next: ?*Completion = null,
-    prev: ?*Completion = null,
-
-    userdata: ?*anyopaque = null,
-
-    callback: Callback = NoopCallback,
-
-    wd: i32 = -1,
-
-    flags: packed struct {
-        state: State = .dead,
-    } = .{},
-
-    const State = enum(u1) {
-        dead = 0,
-
-        active = 1,
-    };
-
-    pub fn state(self: Completion) CompletionState {
-        return switch (self.flags.state) {
-            .dead => .dead,
-            .active => .active,
-        };
-    }
-
-    pub fn invoke(self: *Completion, res: u32) CallbackAction {
-        return self.callback(self.userdata, self, res);
-    }
-};
 
 pub const Result = enum {};
 
@@ -338,6 +292,69 @@ pub fn FileSystemTest(comptime xev: type) type {
             // Assert that the callback was invoked
             try testing.expectEqual(counter, 2);
             try testing.expectEqual(counter2, 1);
+        }
+
+        test "test inotify directory watcher" {
+            var loop = try xev.Loop.init(.{});
+            defer loop.deinit();
+
+            var fs = try FS.init();
+            defer fs.deinit();
+
+            const dir_path = "test_directory_kqueue";
+            try std.fs.cwd().makeDir(dir_path);
+            defer std.fs.cwd().deleteDir(dir_path) catch {};
+
+            const Event = struct { count: usize, flags: u32 };
+
+            var event = Event{ .count = 0, .flags = 0 };
+            const dir_callback_fn = struct {
+                fn invoke(ud: ?*anyopaque, _: *Completion, flags: u32) CallbackAction {
+                    const evt: *Event = @ptrCast(@alignCast(ud.?));
+                    evt.flags = flags;
+                    evt.count += 1;
+                    return .rearm;
+                }
+            }.invoke;
+
+            var comp: Completion = .{
+                .userdata = &event,
+                .callback = dir_callback_fn,
+            };
+
+            try fs.watch(&loop, dir_path, &comp);
+            _ = try loop.run(.no_wait);
+
+            try testing.expectEqual(event.count, 0);
+
+            const file1_path = dir_path ++ "/file1.txt";
+            _ = try std.fs.cwd().createFile(file1_path, .{});
+
+            _ = try loop.run(.once);
+            try testing.expectEqual(event.count, 1);
+            try testing.expectEqual(linux.IN.CREATE, event.flags);
+
+            std.fs.cwd().deleteFile(file1_path) catch {};
+
+            _ = try loop.run(.once);
+            try testing.expectEqual(event.count, 2);
+            try testing.expectEqual(linux.IN.DELETE, event.flags);
+
+            _ = try std.fs.cwd().createFile(file1_path, .{});
+            defer std.fs.cwd().deleteFile(file1_path) catch {};
+
+            _ = try loop.run(.once);
+            try testing.expectEqual(event.count, 3);
+            try testing.expectEqual(linux.IN.CREATE, event.flags);
+
+            var file_handle = try std.fs.cwd().openFile(file1_path, .{ .mode = .read_write });
+            defer file_handle.close();
+            _ = try file_handle.write("some content");
+            try file_handle.sync();
+
+            _ = try loop.run(.no_wait);
+            try testing.expectEqual(event.count, 4);
+            try testing.expectEqual(linux.IN.MODIFY, event.flags);
         }
     };
 }
