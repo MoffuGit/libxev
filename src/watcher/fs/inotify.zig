@@ -27,7 +27,7 @@ pub fn FileSystem(comptime xev: type) type {
 
         const Self = @This();
 
-        pub fn init() !Self {
+        pub fn init() Self {
             return .{};
         }
 
@@ -144,7 +144,7 @@ pub fn FileSystem(comptime xev: type) type {
         }
 
         pub fn cancel(self: *Self, c: *Completion) void {
-            var temp_wd = FileWatcher{ .wd = @intCast(c.wd) };
+            var temp_wd = FileWatcher{ .wd = c.wd };
 
             if (self.tree.find(&temp_wd)) |watcher| {
                 watcher.completions.remove(c);
@@ -176,7 +176,7 @@ pub fn FileSystemTest(comptime xev: type) type {
             var loop = try xev.Loop.init(.{});
             defer loop.deinit();
 
-            var fs = try FS.init();
+            var fs = FS.init();
             defer fs.deinit();
 
             // Test Case 1: Watch a single path with multiple completions
@@ -236,11 +236,11 @@ pub fn FileSystemTest(comptime xev: type) type {
             try testing.expectEqual(fs.pool.countFree(), 97);
         }
 
-        test "test inotify polling" {
+        test "test inotify file watcher" {
             var loop = try xev.Loop.init(.{});
             defer loop.deinit();
 
-            var fs = try FS.init();
+            var fs = FS.init();
             defer fs.deinit();
 
             _ = try loop.run(.no_wait);
@@ -298,7 +298,7 @@ pub fn FileSystemTest(comptime xev: type) type {
             var loop = try xev.Loop.init(.{});
             defer loop.deinit();
 
-            var fs = try FS.init();
+            var fs = FS.init();
             defer fs.deinit();
 
             const dir_path = "test_directory_kqueue";

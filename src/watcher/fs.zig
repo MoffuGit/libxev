@@ -48,16 +48,10 @@ fn FileSystemDynamic(comptime xev: type) type {
         pub fn watch(self: *Self, loop: *xev.Loop, path: []const u8, c: *Completion) !void {
             switch (xev.backend) {
                 inline else => |tag| {
-                    c.ensureTag(tag);
-
                     try @field(
                         self.backend,
                         @tagName(tag),
-                    ).watch(
-                        &@field(loop.backend, @tagName(tag)),
-                        path,
-                        &@field(c.value, @tagName(tag)),
-                    );
+                    ).watch(&@field(loop.backend, @tagName(tag)), path, c);
                 },
             }
         }
@@ -65,20 +59,16 @@ fn FileSystemDynamic(comptime xev: type) type {
         pub fn cancel(self: *Self, c: *Completion) void {
             switch (xev.backend) {
                 inline else => |tag| {
-                    c.ensureTag(tag);
-
                     @field(
                         self.backend,
                         @tagName(tag),
-                    ).cancel(
-                        &@field(c.value, @tagName(tag)),
-                    );
+                    ).cancel(c);
                 },
             }
         }
 
         test {
-            _ = FileSystemTest(xev, Self);
+            _ = FileSystemTest(xev);
         }
     };
 }
@@ -197,60 +187,120 @@ pub fn FileSystemTest(comptime xev: type) type {
             var loop = try xev.Loop.init(.{});
             defer loop.deinit();
 
-            var fs = try FS.init();
+            var fs = FS.init();
             defer fs.deinit();
 
-            // const path1 = "test_path_1";
-            // _ = try std.fs.cwd().createFile(path1, .{});
-            // defer std.fs.cwd().deleteFile(path1) catch {};
-            // var comp1_1: Completion = .{};
-            // var comp1_2: Completion = .{};
-            // var comp1_3: Completion = .{};
-            //
-            // try fs.watch(&loop, path1, &comp1_1);
-            // try fs.watch(&loop, path1, &comp1_2);
-            // try fs.watch(&loop, path1, &comp1_3);
-            //
-            // const path2 = "test_path_2";
-            // const path3 = "test_path_3";
-            // var comp2_1: Completion = .{};
-            // var comp3_1: Completion = .{};
-            //
-            // _ = try std.fs.cwd().createFile(path2, .{});
-            // defer std.fs.cwd().deleteFile(path2) catch {};
-            // _ = try std.fs.cwd().createFile(path3, .{});
-            // defer std.fs.cwd().deleteFile(path3) catch {};
-            //
-            // try fs.watch(&loop, path2, &comp2_1);
-            // try fs.watch(&loop, path3, &comp3_1);
-            //
-            // const path4 = "test_path_4";
-            // const path5 = "test_path_5";
-            // _ = try std.fs.cwd().createFile(path4, .{});
-            // defer std.fs.cwd().deleteFile(path4) catch {};
-            // _ = try std.fs.cwd().createFile(path5, .{});
-            // defer std.fs.cwd().deleteFile(path5) catch {};
-            // var comp4_1: Completion = .{};
-            // var comp4_2: Completion = .{};
-            // var comp5_1: Completion = .{};
-            // var comp5_2: Completion = .{};
-            // var comp5_3: Completion = .{};
-            //
-            // try fs.watch(&loop, path4, &comp4_1);
-            // try fs.watch(&loop, path4, &comp4_2);
-            // try fs.watch(&loop, path5, &comp5_1);
-            // try fs.watch(&loop, path5, &comp5_2);
-            // try fs.watch(&loop, path5, &comp5_3);
-            //
-            // try testing.expectEqual(fs.pool.countFree(), 95);
-            //
-            // fs.cancel(&comp4_1);
-            // fs.cancel(&comp4_2);
-            // fs.cancel(&comp5_1);
-            // fs.cancel(&comp5_2);
-            // fs.cancel(&comp5_3);
-            //
-            // try testing.expectEqual(fs.pool.countFree(), 97);
+            const path1 = "test_path_1";
+            _ = try std.fs.cwd().createFile(path1, .{});
+            defer std.fs.cwd().deleteFile(path1) catch {};
+            var comp1_1: Completion = .{};
+            var comp1_2: Completion = .{};
+            var comp1_3: Completion = .{};
+
+            try fs.watch(&loop, path1, &comp1_1);
+            try fs.watch(&loop, path1, &comp1_2);
+            try fs.watch(&loop, path1, &comp1_3);
+
+            const path2 = "test_path_2";
+            const path3 = "test_path_3";
+            var comp2_1: Completion = .{};
+            var comp3_1: Completion = .{};
+
+            _ = try std.fs.cwd().createFile(path2, .{});
+            defer std.fs.cwd().deleteFile(path2) catch {};
+            _ = try std.fs.cwd().createFile(path3, .{});
+            defer std.fs.cwd().deleteFile(path3) catch {};
+
+            try fs.watch(&loop, path2, &comp2_1);
+            try fs.watch(&loop, path3, &comp3_1);
+
+            const path4 = "test_path_4";
+            const path5 = "test_path_5";
+            _ = try std.fs.cwd().createFile(path4, .{});
+            defer std.fs.cwd().deleteFile(path4) catch {};
+            _ = try std.fs.cwd().createFile(path5, .{});
+            defer std.fs.cwd().deleteFile(path5) catch {};
+            var comp4_1: Completion = .{};
+            var comp4_2: Completion = .{};
+            var comp5_1: Completion = .{};
+            var comp5_2: Completion = .{};
+            var comp5_3: Completion = .{};
+
+            try fs.watch(&loop, path4, &comp4_1);
+            try fs.watch(&loop, path4, &comp4_2);
+            try fs.watch(&loop, path5, &comp5_1);
+            try fs.watch(&loop, path5, &comp5_2);
+            try fs.watch(&loop, path5, &comp5_3);
+
+            fs.cancel(&comp4_1);
+            fs.cancel(&comp4_2);
+            fs.cancel(&comp5_1);
+            fs.cancel(&comp5_2);
+            fs.cancel(&comp5_3);
+
+            try testing.expectEqual(comp4_1.flags.state, .dead);
+            try testing.expectEqual(comp4_2.flags.state, .dead);
+            try testing.expectEqual(comp5_1.flags.state, .dead);
+            try testing.expectEqual(comp5_2.flags.state, .dead);
+            try testing.expectEqual(comp5_3.flags.state, .dead);
+        }
+
+        test "test dynamic file watcher" {
+            var loop = try xev.Loop.init(.{});
+            defer loop.deinit();
+
+            var fs = FS.init();
+            defer fs.deinit();
+
+            _ = try loop.run(.no_wait);
+
+            const path1 = "test_path_1";
+            const file = try std.fs.cwd().createFile(path1, .{});
+            defer std.fs.cwd().deleteFile(path1) catch {};
+
+            var counter: usize = 0;
+            const custom_callback = struct {
+                fn invoke(ud: ?*anyopaque, _: *Completion, _: u32) CallbackAction {
+                    const cnt: *usize = @ptrCast(@alignCast(ud.?));
+                    cnt.* += 1;
+                    return .rearm;
+                }
+            }.invoke;
+
+            var comp: Completion = .{
+                .userdata = &counter, // Pass the address of the counter
+                .callback = custom_callback,
+            };
+
+            try fs.watch(&loop, path1, &comp);
+
+            _ = try file.write("hello");
+            try file.sync();
+
+            // Run the event loop to process the inotify event
+            _ = try loop.run(.no_wait);
+
+            // Assert that the callback was invoked
+            try testing.expectEqual(counter, 1);
+
+            var counter2: usize = 0;
+
+            var comp2: Completion = .{
+                .userdata = &counter2, // Pass the address of the counter
+                .callback = custom_callback,
+            };
+
+            try fs.watch(&loop, path1, &comp2);
+
+            _ = try file.write("hello");
+            try file.sync();
+
+            // Run the event loop to process the inotify event
+            _ = try loop.run(.no_wait);
+
+            // Assert that the callback was invoked
+            try testing.expectEqual(counter, 2);
+            try testing.expectEqual(counter2, 1);
         }
     };
 }

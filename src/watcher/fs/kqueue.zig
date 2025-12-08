@@ -40,7 +40,7 @@ pub fn FileSystem(comptime xev: type) type {
 
         const Self = @This();
 
-        pub fn init() !Self {
+        pub fn init() Self {
             return .{};
         }
 
@@ -165,7 +165,7 @@ pub fn FileSystemTest(comptime xev: type) type {
             var loop = try xev.Loop.init(.{});
             defer loop.deinit();
 
-            var fs = try FS.init();
+            var fs = FS.init();
             defer fs.deinit();
 
             const path1 = "test_path_1";
@@ -225,7 +225,7 @@ pub fn FileSystemTest(comptime xev: type) type {
             var loop = try xev.Loop.init(.{});
             defer loop.deinit();
 
-            var fs = try FS.init();
+            var fs = FS.init();
             defer fs.deinit();
 
             _ = try loop.run(.no_wait);
@@ -281,7 +281,7 @@ pub fn FileSystemTest(comptime xev: type) type {
             var loop = try xev.Loop.init(.{});
             defer loop.deinit();
 
-            var fs = try FS.init();
+            var fs = FS.init();
             defer fs.deinit();
 
             const dir_path = "test_directory_kqueue";
