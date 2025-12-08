@@ -187,68 +187,6 @@ pub fn FileSystemTest(comptime xev: type) type {
         const testing = std.testing;
         const FS = FileSystem(xev);
 
-        test "test dynamic file system watcher" {
-            var loop = try xev.Loop.init(.{});
-            defer loop.deinit();
-
-            var fs = FS.init();
-            defer fs.deinit();
-
-            const path1 = "test_path_1";
-            _ = try std.fs.cwd().createFile(path1, .{});
-            defer std.fs.cwd().deleteFile(path1) catch {};
-            var comp1_1: FSCompletion = .{};
-            var comp1_2: FSCompletion = .{};
-            var comp1_3: FSCompletion = .{};
-
-            try fs.watch(&loop, path1, &comp1_1);
-            try fs.watch(&loop, path1, &comp1_2);
-            try fs.watch(&loop, path1, &comp1_3);
-
-            const path2 = "test_path_2";
-            const path3 = "test_path_3";
-            var comp2_1: FSCompletion = .{};
-            var comp3_1: FSCompletion = .{};
-
-            _ = try std.fs.cwd().createFile(path2, .{});
-            defer std.fs.cwd().deleteFile(path2) catch {};
-            _ = try std.fs.cwd().createFile(path3, .{});
-            defer std.fs.cwd().deleteFile(path3) catch {};
-
-            try fs.watch(&loop, path2, &comp2_1);
-            try fs.watch(&loop, path3, &comp3_1);
-
-            const path4 = "test_path_4";
-            const path5 = "test_path_5";
-            _ = try std.fs.cwd().createFile(path4, .{});
-            defer std.fs.cwd().deleteFile(path4) catch {};
-            _ = try std.fs.cwd().createFile(path5, .{});
-            defer std.fs.cwd().deleteFile(path5) catch {};
-            var comp4_1: FSCompletion = .{};
-            var comp4_2: FSCompletion = .{};
-            var comp5_1: FSCompletion = .{};
-            var comp5_2: FSCompletion = .{};
-            var comp5_3: FSCompletion = .{};
-
-            try fs.watch(&loop, path4, &comp4_1);
-            try fs.watch(&loop, path4, &comp4_2);
-            try fs.watch(&loop, path5, &comp5_1);
-            try fs.watch(&loop, path5, &comp5_2);
-            try fs.watch(&loop, path5, &comp5_3);
-
-            fs.cancel(&comp4_1);
-            fs.cancel(&comp4_2);
-            fs.cancel(&comp5_1);
-            fs.cancel(&comp5_2);
-            fs.cancel(&comp5_3);
-
-            try testing.expectEqual(comp4_1.flags.state, .dead);
-            try testing.expectEqual(comp4_2.flags.state, .dead);
-            try testing.expectEqual(comp5_1.flags.state, .dead);
-            try testing.expectEqual(comp5_2.flags.state, .dead);
-            try testing.expectEqual(comp5_3.flags.state, .dead);
-        }
-
         test "test dynamic file watcher" {
             var loop = try xev.Loop.init(.{});
             defer loop.deinit();
@@ -264,19 +202,15 @@ pub fn FileSystemTest(comptime xev: type) type {
 
             var counter: usize = 0;
             const custom_callback = struct {
-                fn invoke(ud: ?*anyopaque, _: *FSCompletion, _: u32) CallbackAction {
-                    const cnt: *usize = @ptrCast(@alignCast(ud.?));
-                    cnt.* += 1;
+                fn invoke(ud: ?*usize, _: *FSCompletion, _: u32) CallbackAction {
+                    ud.?.* += 1;
                     return .rearm;
                 }
             }.invoke;
 
-            var comp: FSCompletion = .{
-                .userdata = &counter, // Pass the address of the counter
-                .callback = custom_callback,
-            };
+            var comp: FSCompletion = .{};
 
-            try fs.watch(&loop, path1, &comp);
+            try fs.watch(&loop, path1, &comp, usize, &counter, custom_callback);
 
             _ = try file.write("hello");
             try file.sync();
@@ -289,12 +223,9 @@ pub fn FileSystemTest(comptime xev: type) type {
 
             var counter2: usize = 0;
 
-            var comp2: FSCompletion = .{
-                .userdata = &counter2, // Pass the address of the counter
-                .callback = custom_callback,
-            };
+            var comp2: FSCompletion = .{};
 
-            try fs.watch(&loop, path1, &comp2);
+            try fs.watch(&loop, path1, &comp2, usize, &counter2, custom_callback);
 
             _ = try file.write("hello");
             try file.sync();

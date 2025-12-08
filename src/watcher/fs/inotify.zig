@@ -210,7 +210,7 @@ pub fn FileSystemTest(comptime xev: type) type {
 
             var comp: FSCompletion = .{};
 
-            try fs.watch(&loop, path1, &comp, &counter, custom_callback);
+            try fs.watch(&loop, path1, &comp, usize, &counter, custom_callback);
 
             _ = try file.write("hello");
             try file.sync();
@@ -225,7 +225,7 @@ pub fn FileSystemTest(comptime xev: type) type {
 
             var comp2: FSCompletion = .{};
 
-            try fs.watch(&loop, path1, &comp2, &counter2, custom_callback);
+            try fs.watch(&loop, path1, &comp2, usize, &counter2, custom_callback);
 
             _ = try file.write("hello");
             try file.sync();
@@ -262,7 +262,7 @@ pub fn FileSystemTest(comptime xev: type) type {
 
             var comp: FSCompletion = .{};
 
-            try fs.watch(&loop, dir_path, &comp, &event, dir_callback_fn);
+            try fs.watch(&loop, dir_path, &comp, Event, &event, dir_callback_fn);
             _ = try loop.run(.no_wait);
 
             try testing.expectEqual(event.count, 0);
