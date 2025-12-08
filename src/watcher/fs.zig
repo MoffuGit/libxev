@@ -45,13 +45,17 @@ fn FileSystemDynamic(comptime xev: type) type {
             }
         }
 
-        pub fn watch(self: *Self, loop: *xev.Loop, path: []const u8, c: *FSCompletion) !void {
+        pub fn watch(self: *Self, loop: *xev.Loop, path: []const u8, c: *FSCompletion, comptime Userdata: type, userdata: ?*Userdata, comptime cb: *const fn (
+            ud: ?*Userdata,
+            completion: *FSCompletion,
+            result: u32,
+        ) CallbackAction) !void {
             switch (xev.backend) {
                 inline else => |tag| {
                     try @field(
                         self.backend,
                         @tagName(tag),
-                    ).watch(&@field(loop.backend, @tagName(tag)), path, c);
+                    ).watch(&@field(loop.backend, @tagName(tag)), path, c, Userdata, userdata, cb);
                 },
             }
         }

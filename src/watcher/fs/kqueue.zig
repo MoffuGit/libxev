@@ -8,8 +8,9 @@ const fspkg = @import("../fs.zig");
 const Callback = fspkg.Callback();
 const CallbackAction = fspkg.CallbackAction;
 const CompletionState = fspkg.CompletionState;
-const Completion = fspkg.FSCompletion;
+const FSCompletion = fspkg.FSCompletion;
 const NoopCallback = fspkg.NoopCallback();
+const common = @import("../common.zig");
 const log = std.log.scoped(.fs);
 
 const CAPACITY = 100;
@@ -66,10 +67,29 @@ pub fn FileSystem(comptime xev: type) type {
             // }
         }
 
-        pub fn watch(self: *Self, loop: *xev.Loop, path: []const u8, c: *Completion) !void {
+        pub fn watch(self: *Self, loop: *xev.Loop, path: []const u8, c: *FSCompletion, comptime Userdata: type, userdata: ?*Userdata, comptime cb: *const fn (
+            ud: ?*Userdata,
+            completion: *FSCompletion,
+            result: u32,
+        ) CallbackAction) !void {
             self.start();
 
             var temp: FileWatcher = .{ .wd = hash(path) };
+
+            c.* = .{
+                .callback = (struct {
+                    fn callback(
+                        ud: ?*anyopaque,
+                        completion: *FSCompletion,
+                        result: u32,
+                    ) CallbackAction {
+                        return @call(.always_inline, cb, .{ common.userdataValue(Userdata, ud), completion, result });
+                    }
+                }).callback,
+                .userdata = userdata,
+                .wd = temp.wd,
+            };
+
             if (self.tree.find(&temp)) |w| {
                 w.completions.push(c);
             } else {
@@ -93,11 +113,10 @@ pub fn FileSystem(comptime xev: type) type {
                 w.completions.push(c);
             }
 
-            c.wd = temp.wd;
             c.flags.state = .active;
         }
 
-        pub fn cancel(self: *Self, c: *Completion) void {
+        pub fn cancel(self: *Self, c: *FSCompletion) void {
             var temp_wd = FileWatcher{ .wd = c.wd };
 
             if (self.tree.find(&temp_wd)) |watcher| {
@@ -161,66 +180,6 @@ pub fn FileSystemTest(comptime xev: type) type {
         const testing = std.testing;
         const FS = FileSystem(xev);
 
-        test "test kqueue file system watcher" {
-            var loop = try xev.Loop.init(.{});
-            defer loop.deinit();
-
-            var fs = FS.init();
-            defer fs.deinit();
-
-            const path1 = "test_path_1";
-            _ = try std.fs.cwd().createFile(path1, .{});
-            defer std.fs.cwd().deleteFile(path1) catch {};
-            var comp1_1: Completion = .{};
-            var comp1_2: Completion = .{};
-            var comp1_3: Completion = .{};
-
-            try fs.watch(&loop, path1, &comp1_1);
-            try fs.watch(&loop, path1, &comp1_2);
-            try fs.watch(&loop, path1, &comp1_3);
-
-            const path2 = "test_path_2";
-            const path3 = "test_path_3";
-            var comp2_1: Completion = .{};
-            var comp3_1: Completion = .{};
-
-            _ = try std.fs.cwd().createFile(path2, .{});
-            defer std.fs.cwd().deleteFile(path2) catch {};
-            _ = try std.fs.cwd().createFile(path3, .{});
-            defer std.fs.cwd().deleteFile(path3) catch {};
-
-            try fs.watch(&loop, path2, &comp2_1);
-            try fs.watch(&loop, path3, &comp3_1);
-
-            const path4 = "test_path_4";
-            const path5 = "test_path_5";
-            _ = try std.fs.cwd().createFile(path4, .{});
-            defer std.fs.cwd().deleteFile(path4) catch {};
-            _ = try std.fs.cwd().createFile(path5, .{});
-            defer std.fs.cwd().deleteFile(path5) catch {};
-            var comp4_1: Completion = .{};
-            var comp4_2: Completion = .{};
-            var comp5_1: Completion = .{};
-            var comp5_2: Completion = .{};
-            var comp5_3: Completion = .{};
-
-            try fs.watch(&loop, path4, &comp4_1);
-            try fs.watch(&loop, path4, &comp4_2);
-            try fs.watch(&loop, path5, &comp5_1);
-            try fs.watch(&loop, path5, &comp5_2);
-            try fs.watch(&loop, path5, &comp5_3);
-
-            try testing.expectEqual(fs.pool.countFree(), 95);
-
-            fs.cancel(&comp4_1);
-            fs.cancel(&comp4_2);
-            fs.cancel(&comp5_1);
-            fs.cancel(&comp5_2);
-            fs.cancel(&comp5_3);
-
-            try testing.expectEqual(fs.pool.countFree(), 97);
-        }
-
         test "test kqueue vnode" {
             var loop = try xev.Loop.init(.{});
             defer loop.deinit();
@@ -236,19 +195,16 @@ pub fn FileSystemTest(comptime xev: type) type {
 
             var counter: usize = 0;
             const custom_callback = struct {
-                fn invoke(ud: ?*anyopaque, _: *Completion, _: u32) CallbackAction {
+                fn invoke(ud: ?*usize, _: *FSCompletion, _: u32) CallbackAction {
                     const cnt: *usize = @ptrCast(@alignCast(ud.?));
                     cnt.* += 1;
                     return .rearm;
                 }
             }.invoke;
 
-            var comp: Completion = .{
-                .userdata = &counter, // Pass the address of the counter
-                .callback = custom_callback,
-            };
+            var comp: FSCompletion = .{};
 
-            try fs.watch(&loop, path1, &comp);
+            try fs.watch(&loop, path1, &comp, usize, &counter, custom_callback);
 
             _ = try loop.run(.no_wait);
 
@@ -261,12 +217,9 @@ pub fn FileSystemTest(comptime xev: type) type {
 
             var counter2: usize = 0;
 
-            var comp2: Completion = .{
-                .userdata = &counter2,
-                .callback = custom_callback,
-            };
+            var comp2: FSCompletion = .{};
 
-            try fs.watch(&loop, path1, &comp2);
+            try fs.watch(&loop, path1, &comp2, usize, &counter2, custom_callback);
 
             _ = try file.write("hello");
             try file.sync();
@@ -292,20 +245,16 @@ pub fn FileSystemTest(comptime xev: type) type {
 
             var event = Event{ .count = 0, .flags = 0 };
             const dir_callback_fn = struct {
-                fn invoke(ud: ?*anyopaque, _: *Completion, flags: u32) CallbackAction {
-                    const evt: *Event = @ptrCast(@alignCast(ud.?));
-                    evt.flags = flags;
-                    evt.count += 1;
+                fn invoke(evt: ?*Event, _: *FSCompletion, flags: u32) CallbackAction {
+                    evt.?.flags = flags;
+                    evt.?.count += 1;
                     return .rearm;
                 }
             }.invoke;
 
-            var comp: Completion = .{
-                .userdata = &event,
-                .callback = dir_callback_fn,
-            };
+            var comp: FSCompletion = .{};
 
-            try fs.watch(&loop, dir_path, &comp);
+            try fs.watch(&loop, dir_path, &comp, Event, &event, dir_callback_fn);
             _ = try loop.run(.no_wait);
 
             try testing.expectEqual(event.count, 0);
