@@ -8,7 +8,7 @@ const fspkg = @import("../fs.zig");
 const Callback = fspkg.Callback();
 const CallbackAction = fspkg.CallbackAction;
 const CompletionState = fspkg.CompletionState;
-const Completion = fspkg.Completion;
+const Completion = fspkg.FSCompletion;
 const NoopCallback = fspkg.NoopCallback();
 const log = std.log.scoped(.fs);
 

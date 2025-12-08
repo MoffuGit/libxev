@@ -11,7 +11,7 @@ pub fn FileSystem(comptime xev: type) type {
         .epoll,
         => inotify.FileSystem(xev),
         .kqueue => kqueue.FileSystem(xev),
-        else => unreachable,
+        else => struct {},
     };
 }
 
@@ -45,7 +45,7 @@ fn FileSystemDynamic(comptime xev: type) type {
             }
         }
 
-        pub fn watch(self: *Self, loop: *xev.Loop, path: []const u8, c: *Completion) !void {
+        pub fn watch(self: *Self, loop: *xev.Loop, path: []const u8, c: *FSCompletion) !void {
             switch (xev.backend) {
                 inline else => |tag| {
                     try @field(
@@ -56,7 +56,7 @@ fn FileSystemDynamic(comptime xev: type) type {
             }
         }
 
-        pub fn cancel(self: *Self, c: *Completion) void {
+        pub fn cancel(self: *Self, c: *FSCompletion) void {
             switch (xev.backend) {
                 inline else => |tag| {
                     @field(
@@ -84,7 +84,7 @@ pub fn FileWatcher(comptime xev: type) type {
 
             next: ?*Self = null,
             rb_node: tree.IntrusiveField(Self) = .{},
-            completions: double.Intrusive(Completion) = .{},
+            completions: double.Intrusive(FSCompletion) = .{},
 
             pub fn compare(a: *Self, b: *Self) std.math.Order {
                 if (a.wd > b.wd) return .gt;
@@ -102,7 +102,7 @@ pub fn FileWatcher(comptime xev: type) type {
 
             next: ?*Self = null,
             rb_node: tree.IntrusiveField(Self) = .{},
-            completions: double.Intrusive(Completion) = .{},
+            completions: double.Intrusive(FSCompletion) = .{},
 
             pub fn compare(a: *Self, b: *Self) std.math.Order {
                 if (a.wd > b.wd) return .gt;
@@ -114,9 +114,9 @@ pub fn FileWatcher(comptime xev: type) type {
     };
 }
 
-pub const Completion = struct {
-    next: ?*Completion = null,
-    prev: ?*Completion = null,
+pub const FSCompletion = struct {
+    next: ?*FSCompletion = null,
+    prev: ?*FSCompletion = null,
 
     userdata: ?*anyopaque = null,
 
@@ -134,14 +134,14 @@ pub const Completion = struct {
         active = 1,
     };
 
-    pub fn state(self: Completion) CompletionState {
+    pub fn state(self: FSCompletion) CompletionState {
         return switch (self.flags.state) {
             .dead => .dead,
             .active => .active,
         };
     }
 
-    pub fn invoke(self: *Completion, res: u32) CallbackAction {
+    pub fn invoke(self: *FSCompletion, res: u32) CallbackAction {
         return self.callback(self.userdata, self, res);
     }
 };
@@ -149,7 +149,7 @@ pub const Completion = struct {
 pub fn Callback() type {
     return *const fn (
         userdata: ?*anyopaque,
-        completion: *Completion,
+        completion: *FSCompletion,
         result: u32,
     ) CallbackAction;
 }
@@ -158,7 +158,7 @@ pub fn NoopCallback() Callback() {
     return (struct {
         pub fn noopCallback(
             _: ?*anyopaque,
-            _: *Completion,
+            _: *FSCompletion,
             _: u32,
         ) CallbackAction {
             return .disarm;
@@ -193,9 +193,9 @@ pub fn FileSystemTest(comptime xev: type) type {
             const path1 = "test_path_1";
             _ = try std.fs.cwd().createFile(path1, .{});
             defer std.fs.cwd().deleteFile(path1) catch {};
-            var comp1_1: Completion = .{};
-            var comp1_2: Completion = .{};
-            var comp1_3: Completion = .{};
+            var comp1_1: FSCompletion = .{};
+            var comp1_2: FSCompletion = .{};
+            var comp1_3: FSCompletion = .{};
 
             try fs.watch(&loop, path1, &comp1_1);
             try fs.watch(&loop, path1, &comp1_2);
@@ -203,8 +203,8 @@ pub fn FileSystemTest(comptime xev: type) type {
 
             const path2 = "test_path_2";
             const path3 = "test_path_3";
-            var comp2_1: Completion = .{};
-            var comp3_1: Completion = .{};
+            var comp2_1: FSCompletion = .{};
+            var comp3_1: FSCompletion = .{};
 
             _ = try std.fs.cwd().createFile(path2, .{});
             defer std.fs.cwd().deleteFile(path2) catch {};
@@ -220,11 +220,11 @@ pub fn FileSystemTest(comptime xev: type) type {
             defer std.fs.cwd().deleteFile(path4) catch {};
             _ = try std.fs.cwd().createFile(path5, .{});
             defer std.fs.cwd().deleteFile(path5) catch {};
-            var comp4_1: Completion = .{};
-            var comp4_2: Completion = .{};
-            var comp5_1: Completion = .{};
-            var comp5_2: Completion = .{};
-            var comp5_3: Completion = .{};
+            var comp4_1: FSCompletion = .{};
+            var comp4_2: FSCompletion = .{};
+            var comp5_1: FSCompletion = .{};
+            var comp5_2: FSCompletion = .{};
+            var comp5_3: FSCompletion = .{};
 
             try fs.watch(&loop, path4, &comp4_1);
             try fs.watch(&loop, path4, &comp4_2);
@@ -260,14 +260,14 @@ pub fn FileSystemTest(comptime xev: type) type {
 
             var counter: usize = 0;
             const custom_callback = struct {
-                fn invoke(ud: ?*anyopaque, _: *Completion, _: u32) CallbackAction {
+                fn invoke(ud: ?*anyopaque, _: *FSCompletion, _: u32) CallbackAction {
                     const cnt: *usize = @ptrCast(@alignCast(ud.?));
                     cnt.* += 1;
                     return .rearm;
                 }
             }.invoke;
 
-            var comp: Completion = .{
+            var comp: FSCompletion = .{
                 .userdata = &counter, // Pass the address of the counter
                 .callback = custom_callback,
             };
@@ -285,7 +285,7 @@ pub fn FileSystemTest(comptime xev: type) type {
 
             var counter2: usize = 0;
 
-            var comp2: Completion = .{
+            var comp2: FSCompletion = .{
                 .userdata = &counter2, // Pass the address of the counter
                 .callback = custom_callback,
             };
