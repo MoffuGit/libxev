@@ -5,11 +5,6 @@ const double = @import("../../queue_double.zig");
 const tree = @import("../../tree.zig");
 const pool = @import("../../pool.zig");
 const fspkg = @import("../fs.zig");
-const Callback = fspkg.Callback();
-const CallbackAction = fspkg.CallbackAction;
-const CompletionState = fspkg.CompletionState;
-const FSCompletion = fspkg.FSCompletion;
-const NoopCallback = fspkg.NoopCallback();
 const common = @import("../common.zig");
 const log = std.log.scoped(.fs);
 
@@ -28,6 +23,9 @@ fn hash(bytes: []const u8) u32 {
 }
 
 pub fn FileSystem(comptime xev: type) type {
+    const CallbackAction = xev.CallbackAction;
+    const FSCompletion = fspkg.FSCompletion(xev);
+
     return struct {
         pub const FileWatcher = fspkg.FileWatcher(xev);
         const WatcherPool = pool.Intrusive(FileWatcher);
@@ -176,6 +174,9 @@ pub fn FileSystem(comptime xev: type) type {
 }
 
 pub fn FileSystemTest(comptime xev: type) type {
+    const CallbackAction = xev.CallbackAction;
+    const FSCompletion = fspkg.FSCompletion(xev);
+
     return struct {
         const testing = std.testing;
         const FS = FileSystem(xev);
