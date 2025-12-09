@@ -21,7 +21,7 @@ pub fn FileSystem(comptime xev: type) type {
 
             userdata: ?*anyopaque = null,
 
-            callback: Callback(xev) = NoopCallback(xev),
+            callback: Callback = NoopCallback,
 
             wd: u32 = 0,
 
@@ -245,7 +245,7 @@ pub fn FileSystemTest(comptime xev: type) type {
             var counter: usize = 0;
 
             const custom_callback = struct {
-                fn invoke(ud: ?*usize, _: *FS.FSCompletion, _: u32) xev.CallbackAction {
+                fn invoke(ud: ?*usize, _: *FS.Completion, _: u32) xev.CallbackAction {
                     ud.?.* += 1;
                     return .rearm;
                 }
