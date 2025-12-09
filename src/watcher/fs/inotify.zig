@@ -48,6 +48,7 @@ pub fn FileSystem(comptime xev: type) type {
         };
         const FileWatcher = struct {
             wd: u32,
+            path: []const u8 = undefined,
 
             next: ?*FileWatcher = null,
             rb_node: tree.IntrusiveField(FileWatcher) = .{},
@@ -192,7 +193,7 @@ pub fn FileSystem(comptime xev: type) type {
                 w.completions.push(c);
             } else {
                 const w = try self.pool.alloc();
-                w.* = .{ .wd = wd };
+                w.* = .{ .wd = wd, .path = path };
                 w.completions.push(c);
                 self.tree.insert(w);
             }

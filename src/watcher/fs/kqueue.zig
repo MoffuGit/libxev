@@ -54,8 +54,8 @@ pub fn FileSystem(comptime xev: type) type {
                 };
             }
 
-            pub fn invoke(self: *Completion, res: u32) xev.CallbackAction {
-                return self.callback(self.userdata, self, res);
+            pub fn invoke(self: *Completion, path: []const u8, res: u32) xev.CallbackAction {
+                return self.callback(self.userdata, self, path, res);
             }
         };
         const FileWatcher = struct {
@@ -65,6 +65,7 @@ pub fn FileSystem(comptime xev: type) type {
             c: xev.Completion = .{},
 
             wd: u32,
+            path: []const u8 = undefined,
 
             next: ?*FileWatcher = null,
             rb_node: tree.IntrusiveField(FileWatcher) = .{},
@@ -116,6 +117,7 @@ pub fn FileSystem(comptime xev: type) type {
         pub fn watch(self: *Self, loop: *xev.Loop, path: []const u8, c: *Completion, comptime Userdata: type, userdata: ?*Userdata, comptime cb: *const fn (
             ud: ?*Userdata,
             completion: *Completion,
+            path: []const u8,
             result: u32,
         ) xev.CallbackAction) !void {
             self.start();
@@ -127,9 +129,10 @@ pub fn FileSystem(comptime xev: type) type {
                     fn callback(
                         ud: ?*anyopaque,
                         completion: *Completion,
+                        _path: []const u8,
                         result: u32,
                     ) xev.CallbackAction {
-                        return @call(.always_inline, cb, .{ common.userdataValue(Userdata, ud), completion, result });
+                        return @call(.always_inline, cb, .{ common.userdataValue(Userdata, ud), completion, _path, result });
                     }
                 }).callback,
                 .userdata = userdata,
@@ -140,8 +143,7 @@ pub fn FileSystem(comptime xev: type) type {
                 w.completions.push(c);
             } else {
                 var w = try self.pool.alloc();
-                w.fd = try posix.open(path, posix.O{}, 0);
-                w.wd = temp.wd;
+                w.* = .{ .fd = try posix.open(path, posix.O{}, 0), .wd = temp.wd, .path = path };
 
                 w.c = .{
                     .op = .{
@@ -200,7 +202,7 @@ pub fn FileSystem(comptime xev: type) type {
 
             var current = temp_queue.pop();
             while (current) |comp| {
-                const action = comp.invoke(vnode_flags);
+                const action = comp.invoke(watcher.path, vnode_flags);
                 switch (action) {
                     .disarm => {
                         comp.flags.state = .dead;
@@ -224,6 +226,7 @@ pub fn FileSystem(comptime xev: type) type {
 pub fn FileSystemTest(comptime xev: type) type {
     return struct {
         const testing = std.testing;
+        const assert = std.debug.assert;
         const FS = FileSystem(xev);
 
         test "test kqueue vnode" {
@@ -241,9 +244,10 @@ pub fn FileSystemTest(comptime xev: type) type {
 
             var counter: usize = 0;
             const custom_callback = struct {
-                fn invoke(ud: ?*usize, _: *FS.Completion, _: u32) xev.CallbackAction {
+                fn invoke(ud: ?*usize, _: *FS.Completion, path: []const u8, _: u32) xev.CallbackAction {
                     const cnt: *usize = @ptrCast(@alignCast(ud.?));
                     cnt.* += 1;
+                    assert(std.mem.eql(u8, path1, path));
                     return .rearm;
                 }
             }.invoke;
@@ -291,9 +295,10 @@ pub fn FileSystemTest(comptime xev: type) type {
 
             var event = Event{ .count = 0, .flags = 0 };
             const dir_callback_fn = struct {
-                fn invoke(evt: ?*Event, _: *FS.Completion, flags: u32) xev.CallbackAction {
+                fn invoke(evt: ?*Event, _: *FS.Completion, path: []const u8, flags: u32) xev.CallbackAction {
                     evt.?.flags = flags;
                     evt.?.count += 1;
+                    assert(std.mem.eql(u8, dir_path, path));
                     return .rearm;
                 }
             }.invoke;
@@ -352,8 +357,9 @@ pub fn FileSystemTest(comptime xev: type) type {
             var event = Event{ .count = 0, .flags = 0 };
 
             const dir_callback_fn = struct {
-                fn invoke(evt: ?*Event, _: *FS.Completion, flags: u32) xev.CallbackAction {
+                fn invoke(evt: ?*Event, _: *FS.Completion, path: []const u8, flags: u32) xev.CallbackAction {
                     evt.?.flags = flags;
+                    assert(std.mem.eql(u8, parent_dir_path, path));
                     evt.?.count += 1;
                     return .rearm;
                 }
