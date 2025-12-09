@@ -333,5 +333,63 @@ pub fn FileSystemTest(comptime xev: type) type {
             _ = try loop.run(.no_wait);
             try testing.expectEqual(event.count, 3);
         }
+
+        test "test kqueue directory watcher for subdirectory events" {
+            var loop = try xev.Loop.init(.{});
+            defer loop.deinit();
+
+            var fs = FS.init();
+            defer fs.deinit();
+
+            const parent_dir_path = "test_parent_dir_kqueue_subdir";
+            const sub_dir_path = parent_dir_path ++ "/test_subdir";
+            const file_in_subdir_path = sub_dir_path ++ "/file_in_subdir.txt";
+
+            try std.fs.cwd().makeDir(parent_dir_path);
+            defer std.fs.cwd().deleteTree(parent_dir_path) catch {}; // Clean up parent and its contents
+
+            const Event = struct { count: usize, flags: u32 };
+            var event = Event{ .count = 0, .flags = 0 };
+
+            const dir_callback_fn = struct {
+                fn invoke(evt: ?*Event, _: *FS.Completion, flags: u32) xev.CallbackAction {
+                    evt.?.flags = flags;
+                    evt.?.count += 1;
+                    return .rearm;
+                }
+            }.invoke;
+
+            var comp: FS.Completion = .{};
+
+            // Watch the parent directory
+            try fs.watch(&loop, parent_dir_path, &comp, Event, &event, dir_callback_fn);
+            _ = try loop.run(.no_wait);
+
+            // No events yet
+            try testing.expectEqual(event.count, 0);
+
+            // Create a subdirectory inside the watched parent directory
+            // This should trigger a NOTE_WRITE event on parent_dir_path.
+            try std.fs.cwd().makeDir(sub_dir_path);
+            _ = try loop.run(.once);
+            try testing.expectEqual(event.count, 1);
+            try testing.expectEqual(event.flags, std.c.NOTE.WRITE | std.c.NOTE.LINK);
+
+            // Reset flags for the next check
+            event.flags = 0;
+
+            // Create a file inside the subdirectory
+            // Standard kqueue vnode watch on a directory typically does NOT recursively
+            // watch subdirectories. Therefore, creating a file inside a subdirectory
+            // should NOT trigger a new event on the parent_dir_path watcher.
+            _ = try std.fs.cwd().createFile(file_in_subdir_path, .{});
+            _ = try loop.run(.no_wait);
+
+            // Expect count to remain 1, as no new event for parent_dir_path is expected
+            // from changes within its subdirectories.
+            try testing.expectEqual(event.count, 1);
+            // Flags should still be 0 if no new event fired and it was reset.
+            try testing.expectEqual(event.flags, 0);
+        }
     };
 }
