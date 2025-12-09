@@ -7,6 +7,7 @@ const pool = @import("../../pool.zig");
 const fspkg = @import("../fs.zig");
 const common = @import("../common.zig");
 const log = std.log.scoped(.fs);
+const assert = std.debug.assert;
 
 const CAPACITY = 100;
 
@@ -42,8 +43,8 @@ pub fn FileSystem(comptime xev: type) type {
                 };
             }
 
-            pub fn invoke(self: *Completion, res: u32) xev.CallbackAction {
-                return self.callback(self.userdata, self, res);
+            pub fn invoke(self: *Completion, path: []const u8, res: u32) xev.CallbackAction {
+                return self.callback(self.userdata, self, path, res);
             }
         };
         const FileWatcher = struct {
@@ -128,8 +129,7 @@ pub fn FileSystem(comptime xev: type) type {
 
                     var offset: usize = 0;
                     while (offset < bytes_read) {
-                        const event_ptr: *const linux.inotify_event = @ptrCast(@alignCast(&buffer[offset]));
-                        const event = event_ptr.*;
+                        const event: *const linux.inotify_event = @ptrCast(@alignCast(&buffer[offset]));
 
                         var temp_wd = FileWatcher{ .wd = @intCast(event.wd) };
                         if (self.tree.find(&temp_wd)) |watcher| {
@@ -137,20 +137,41 @@ pub fn FileSystem(comptime xev: type) type {
                             watcher.completions = .{};
 
                             while (current.pop()) |c| {
-                                if (c.invoke(event.mask) == .rearm) {
+                                var path: []const u8 = undefined;
+
+                                if (event.getName()) |p| {
+                                    const w_path_len = watcher.path.len;
+                                    const p_len = p.len;
+                                    var _buffer: [std.fs.max_path_bytes]u8 = undefined;
+
+                                    if (w_path_len + 1 + p_len > std.fs.max_path_bytes) {
+                                        @panic("Combined path exceeds maximum buffer length");
+                                    }
+
+                                    @memcpy(_buffer[0..w_path_len], watcher.path);
+                                    var current_idx: usize = w_path_len;
+
+                                    _buffer[current_idx] = '/';
+                                    current_idx += 1;
+
+                                    @memcpy(_buffer[current_idx .. current_idx + p_len], p);
+                                    current_idx += p_len;
+
+                                    path = _buffer[0..current_idx];
+                                } else {
+                                    path = watcher.path;
+                                }
+
+                                if (c.invoke(path, event.mask) == .rearm) {
                                     watcher.completions.push(c);
                                 } else {
                                     c.*.flags.state = .dead;
                                 }
                             }
                         } else {
-                            // Watcher not found. This can happen if a watch was removed but events were
-                            // still pending in the kernel buffer, or due to race conditions.
                             log.warn("inotify event for unknown wd: {}", .{event.wd});
                         }
 
-                        // Advance to the next event in the buffer.
-                        // event.len is the size of the filename string that follows the struct.
                         offset += @sizeOf(linux.inotify_event) + event.len;
                     }
                 }
@@ -164,6 +185,7 @@ pub fn FileSystem(comptime xev: type) type {
         pub fn watch(self: *Self, loop: *xev.Loop, path: []const u8, c: *Completion, comptime Userdata: type, userdata: ?*Userdata, comptime cb: *const fn (
             ud: ?*Userdata,
             completion: *Completion,
+            path: []const u8,
             result: u32,
         ) xev.CallbackAction) !void {
             try self.start(loop);
@@ -181,9 +203,10 @@ pub fn FileSystem(comptime xev: type) type {
                 fn callback(
                     ud: ?*anyopaque,
                     completion: *Completion,
+                    _path: []const u8,
                     result: u32,
                 ) xev.CallbackAction {
-                    return @call(.always_inline, cb, .{ common.userdataValue(Userdata, ud), completion, result });
+                    return @call(.always_inline, cb, .{ common.userdataValue(Userdata, ud), completion, _path, result });
                 }
             }).callback, .wd = wd };
 
@@ -246,7 +269,8 @@ pub fn FileSystemTest(comptime xev: type) type {
             var counter: usize = 0;
 
             const custom_callback = struct {
-                fn invoke(ud: ?*usize, _: *FS.Completion, _: u32) xev.CallbackAction {
+                fn invoke(ud: ?*usize, _: *FS.Completion, path: []const u8, _: u32) xev.CallbackAction {
+                    assert(std.mem.eql(u8, path, path1));
                     ud.?.* += 1;
                     return .rearm;
                 }
@@ -289,7 +313,7 @@ pub fn FileSystemTest(comptime xev: type) type {
             var fs = FS.init();
             defer fs.deinit();
 
-            const dir_path = "test_directory_kqueue";
+            const dir_path = "test_directory_inotify";
             try std.fs.cwd().makeDir(dir_path);
             defer std.fs.cwd().deleteDir(dir_path) catch {};
 
@@ -297,7 +321,7 @@ pub fn FileSystemTest(comptime xev: type) type {
 
             var event = Event{ .count = 0, .flags = 0 };
             const dir_callback_fn = struct {
-                fn invoke(evt: ?*Event, _: *FS.Completion, flags: u32) xev.CallbackAction {
+                fn invoke(evt: ?*Event, _: *FS.Completion, _: []const u8, flags: u32) xev.CallbackAction {
                     evt.?.flags = flags;
                     evt.?.count += 1;
                     return .rearm;
@@ -340,14 +364,14 @@ pub fn FileSystemTest(comptime xev: type) type {
             try testing.expectEqual(event.count, 4);
             try testing.expectEqual(linux.IN.MODIFY, event.flags);
         }
-        test "test kqueue directory watcher for subdirectory events" {
+        test "test inotify directory watcher for subdirectory events" {
             var loop = try xev.Loop.init(.{});
             defer loop.deinit();
 
             var fs = FS.init();
             defer fs.deinit();
 
-            const parent_dir_path = "test_parent_dir_kqueue_subdir";
+            const parent_dir_path = "test_parent_dir_inotify_subdir";
             const sub_dir_path = parent_dir_path ++ "/test_subdir";
             const file_in_subdir_path = sub_dir_path ++ "/file_in_subdir.txt";
 
@@ -358,7 +382,7 @@ pub fn FileSystemTest(comptime xev: type) type {
             var event = Event{ .count = 0, .flags = 0 };
 
             const dir_callback_fn = struct {
-                fn invoke(evt: ?*Event, _: *FS.Completion, flags: u32) xev.CallbackAction {
+                fn invoke(evt: ?*Event, _: *FS.Completion, _: []const u8, flags: u32) xev.CallbackAction {
                     evt.?.flags = flags;
                     evt.?.count += 1;
                     return .rearm;

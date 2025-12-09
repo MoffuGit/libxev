@@ -53,6 +53,7 @@ fn FileSystemDynamic(comptime xev: type) type {
         pub fn watch(self: *Self, loop: *xev.Loop, path: []const u8, c: *Self.Completion, comptime Userdata: type, userdata: ?*Userdata, comptime cb: *const fn (
             ud: ?*Userdata,
             completion: *Self.Completion,
+            path: []const u8,
             result: u32,
         ) xev.CallbackAction) !void {
             switch (xev.backend) {

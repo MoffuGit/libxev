@@ -245,8 +245,7 @@ pub fn FileSystemTest(comptime xev: type) type {
             var counter: usize = 0;
             const custom_callback = struct {
                 fn invoke(ud: ?*usize, _: *FS.Completion, path: []const u8, _: u32) xev.CallbackAction {
-                    const cnt: *usize = @ptrCast(@alignCast(ud.?));
-                    cnt.* += 1;
+                    ud.* += 1;
                     assert(std.mem.eql(u8, path1, path));
                     return .rearm;
                 }
