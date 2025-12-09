@@ -65,7 +65,6 @@ pub fn Xev(comptime be: Backend, comptime T: type) type {
         pub const TCP = @import("watcher/tcp.zig").TCP(Self);
         pub const UDP = @import("watcher/udp.zig").UDP(Self);
         pub const FileSystem = @import("watcher/fs.zig").FileSystem(Self);
-        pub const FSCompletion = @import("watcher/fs.zig").FSCompletion;
 
         /// The callback of the main Loop operations. Higher level interfaces may
         /// use a different callback mechanism.

@@ -23,11 +23,59 @@ fn hash(bytes: []const u8) u32 {
 }
 
 pub fn FileSystem(comptime xev: type) type {
-    const CallbackAction = xev.CallbackAction;
-    const FSCompletion = fspkg.FSCompletion(xev);
-
     return struct {
-        pub const FileWatcher = fspkg.FileWatcher(xev);
+        const Callback = fspkg.Callback(xev, @This());
+        const NoopCallback = fspkg.NoopCallback(xev, @This());
+
+        pub const Completion = struct {
+            next: ?*Completion = null,
+            prev: ?*Completion = null,
+
+            userdata: ?*anyopaque = null,
+
+            callback: Callback = NoopCallback,
+
+            wd: u32 = 0,
+
+            flags: packed struct {
+                state: State = .dead,
+            } = .{},
+
+            const State = enum(u1) {
+                dead = 0,
+
+                active = 1,
+            };
+
+            pub fn state(self: Completion) xev.CompletionState {
+                return switch (self.flags.state) {
+                    .dead => .dead,
+                    .active => .active,
+                };
+            }
+
+            pub fn invoke(self: *Completion, res: u32) xev.CallbackAction {
+                return self.callback(self.userdata, self, res);
+            }
+        };
+        const FileWatcher = struct {
+            const Self = @This();
+
+            fd: i32 = -1,
+            c: xev.Completion = .{},
+
+            wd: u32,
+
+            next: ?*FileWatcher = null,
+            rb_node: tree.IntrusiveField(FileWatcher) = .{},
+            completions: double.Intrusive(Completion) = .{},
+
+            pub fn compare(a: *FileWatcher, b: *FileWatcher) std.math.Order {
+                if (a.wd > b.wd) return .gt;
+                if (a.wd < b.wd) return .lt;
+                return .eq;
+            }
+        };
         const WatcherPool = pool.Intrusive(FileWatcher);
         buffer: [CAPACITY]FileWatcher = undefined,
 
@@ -65,11 +113,11 @@ pub fn FileSystem(comptime xev: type) type {
             // }
         }
 
-        pub fn watch(self: *Self, loop: *xev.Loop, path: []const u8, c: *FSCompletion, comptime Userdata: type, userdata: ?*Userdata, comptime cb: *const fn (
+        pub fn watch(self: *Self, loop: *xev.Loop, path: []const u8, c: *Completion, comptime Userdata: type, userdata: ?*Userdata, comptime cb: *const fn (
             ud: ?*Userdata,
-            completion: *FSCompletion,
+            completion: *Completion,
             result: u32,
-        ) CallbackAction) !void {
+        ) xev.CallbackAction) !void {
             self.start();
 
             var temp: FileWatcher = .{ .wd = hash(path) };
@@ -78,9 +126,9 @@ pub fn FileSystem(comptime xev: type) type {
                 .callback = (struct {
                     fn callback(
                         ud: ?*anyopaque,
-                        completion: *FSCompletion,
+                        completion: *Completion,
                         result: u32,
-                    ) CallbackAction {
+                    ) xev.CallbackAction {
                         return @call(.always_inline, cb, .{ common.userdataValue(Userdata, ud), completion, result });
                     }
                 }).callback,
@@ -114,7 +162,7 @@ pub fn FileSystem(comptime xev: type) type {
             c.flags.state = .active;
         }
 
-        pub fn cancel(self: *Self, c: *FSCompletion) void {
+        pub fn cancel(self: *Self, c: *Completion) void {
             var temp_wd = FileWatcher{ .wd = c.wd };
 
             if (self.tree.find(&temp_wd)) |watcher| {
@@ -174,9 +222,6 @@ pub fn FileSystem(comptime xev: type) type {
 }
 
 pub fn FileSystemTest(comptime xev: type) type {
-    const CallbackAction = xev.CallbackAction;
-    const FSCompletion = fspkg.FSCompletion(xev);
-
     return struct {
         const testing = std.testing;
         const FS = FileSystem(xev);
@@ -196,14 +241,14 @@ pub fn FileSystemTest(comptime xev: type) type {
 
             var counter: usize = 0;
             const custom_callback = struct {
-                fn invoke(ud: ?*usize, _: *FSCompletion, _: u32) CallbackAction {
+                fn invoke(ud: ?*usize, _: *FS.Completion, _: u32) xev.CallbackAction {
                     const cnt: *usize = @ptrCast(@alignCast(ud.?));
                     cnt.* += 1;
                     return .rearm;
                 }
             }.invoke;
 
-            var comp: FSCompletion = .{};
+            var comp: FS.Completion = .{};
 
             try fs.watch(&loop, path1, &comp, usize, &counter, custom_callback);
 
@@ -218,7 +263,7 @@ pub fn FileSystemTest(comptime xev: type) type {
 
             var counter2: usize = 0;
 
-            var comp2: FSCompletion = .{};
+            var comp2: FS.Completion = .{};
 
             try fs.watch(&loop, path1, &comp2, usize, &counter2, custom_callback);
 
@@ -246,14 +291,14 @@ pub fn FileSystemTest(comptime xev: type) type {
 
             var event = Event{ .count = 0, .flags = 0 };
             const dir_callback_fn = struct {
-                fn invoke(evt: ?*Event, _: *FSCompletion, flags: u32) CallbackAction {
+                fn invoke(evt: ?*Event, _: *FS.Completion, flags: u32) xev.CallbackAction {
                     evt.?.flags = flags;
                     evt.?.count += 1;
                     return .rearm;
                 }
             }.invoke;
 
-            var comp: FSCompletion = .{};
+            var comp: FS.Completion = .{};
 
             try fs.watch(&loop, dir_path, &comp, Event, &event, dir_callback_fn);
             _ = try loop.run(.no_wait);
