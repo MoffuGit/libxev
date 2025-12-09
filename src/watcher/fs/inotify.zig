@@ -339,5 +339,50 @@ pub fn FileSystemTest(comptime xev: type) type {
             try testing.expectEqual(event.count, 4);
             try testing.expectEqual(linux.IN.MODIFY, event.flags);
         }
+        test "test kqueue directory watcher for subdirectory events" {
+            var loop = try xev.Loop.init(.{});
+            defer loop.deinit();
+
+            var fs = FS.init();
+            defer fs.deinit();
+
+            const parent_dir_path = "test_parent_dir_kqueue_subdir";
+            const sub_dir_path = parent_dir_path ++ "/test_subdir";
+            const file_in_subdir_path = sub_dir_path ++ "/file_in_subdir.txt";
+
+            try std.fs.cwd().makeDir(parent_dir_path);
+            defer std.fs.cwd().deleteTree(parent_dir_path) catch {};
+
+            const Event = struct { count: usize, flags: u32 };
+            var event = Event{ .count = 0, .flags = 0 };
+
+            const dir_callback_fn = struct {
+                fn invoke(evt: ?*Event, _: *FS.Completion, flags: u32) xev.CallbackAction {
+                    evt.?.flags = flags;
+                    evt.?.count += 1;
+                    return .rearm;
+                }
+            }.invoke;
+
+            var comp: FS.Completion = .{};
+
+            try fs.watch(&loop, parent_dir_path, &comp, Event, &event, dir_callback_fn);
+            _ = try loop.run(.no_wait);
+
+            try testing.expectEqual(event.count, 0);
+
+            try std.fs.cwd().makeDir(sub_dir_path);
+            _ = try loop.run(.once);
+            try testing.expectEqual(event.count, 1);
+            try testing.expectEqual(event.flags, linux.IN.CREATE | linux.IN.ISDIR);
+
+            event.flags = 0;
+
+            _ = try std.fs.cwd().createFile(file_in_subdir_path, .{});
+            _ = try loop.run(.no_wait);
+
+            try testing.expectEqual(event.count, 1);
+            try testing.expectEqual(event.flags, 0);
+        }
     };
 }
