@@ -155,9 +155,9 @@ pub fn FileSystem(comptime xev: type) type {
                     .userdata = w,
                     .callback = vnode_callback,
                 };
-                loop.add(&w.c); // Add the kqueue vnode event to the main loop
+                loop.add(&w.c);
 
-                self.tree.insert(w); // Add the FileWatcher to our tree
+                self.tree.insert(w);
                 w.completions.push(c);
             }
 
@@ -190,13 +190,9 @@ pub fn FileSystem(comptime xev: type) type {
             const watcher: *FileWatcher = @ptrCast(@alignCast(ud.?));
             const vnode_flags = result.vnode catch |err| {
                 log.err("Vnode event error for fd {}: {any}", .{ watcher.fd, err });
-                // If there's an error on the vnode watcher itself, disarm it.
-                // All user completions for this watcher will effectively stop receiving events.
                 return .disarm;
             };
 
-            // Temporarily move completions out to process them.
-            // This allows safe modification of the completions queue during iteration.
             var temp_queue = watcher.completions;
             watcher.completions = .{};
 
@@ -245,7 +241,7 @@ pub fn FileSystemTest(comptime xev: type) type {
             var counter: usize = 0;
             const custom_callback = struct {
                 fn invoke(ud: ?*usize, _: *FS.Completion, path: []const u8, _: u32) xev.CallbackAction {
-                    ud.* += 1;
+                    ud.?.* += 1;
                     assert(std.mem.eql(u8, path1, path));
                     return .rearm;
                 }
@@ -347,10 +343,9 @@ pub fn FileSystemTest(comptime xev: type) type {
 
             const parent_dir_path = "test_parent_dir_kqueue_subdir";
             const sub_dir_path = parent_dir_path ++ "/test_subdir";
-            const file_in_subdir_path = sub_dir_path ++ "/file_in_subdir.txt";
 
             try std.fs.cwd().makeDir(parent_dir_path);
-            defer std.fs.cwd().deleteTree(parent_dir_path) catch {}; // Clean up parent and its contents
+            defer std.fs.cwd().deleteTree(parent_dir_path) catch {};
 
             const Event = struct { count: usize, flags: u32 };
             var event = Event{ .count = 0, .flags = 0 };
@@ -366,34 +361,33 @@ pub fn FileSystemTest(comptime xev: type) type {
 
             var comp: FS.Completion = .{};
 
-            // Watch the parent directory
             try fs.watch(&loop, parent_dir_path, &comp, Event, &event, dir_callback_fn);
             _ = try loop.run(.no_wait);
 
-            // No events yet
             try testing.expectEqual(event.count, 0);
 
-            // Create a subdirectory inside the watched parent directory
-            // This should trigger a NOTE_WRITE event on parent_dir_path.
             try std.fs.cwd().makeDir(sub_dir_path);
             _ = try loop.run(.once);
             try testing.expectEqual(event.count, 1);
             try testing.expectEqual(event.flags, std.c.NOTE.WRITE | std.c.NOTE.LINK);
 
+            const renamed_sub_dir_path = parent_dir_path ++ "/renamed_sub_dir_path";
+
+            try std.fs.cwd().rename(sub_dir_path, renamed_sub_dir_path);
+
+            _ = try loop.run(.no_wait);
+            try testing.expectEqual(event.count, 2);
+            try testing.expectEqual(event.flags, std.c.NOTE.WRITE);
+
             // Reset flags for the next check
             event.flags = 0;
 
-            // Create a file inside the subdirectory
-            // Standard kqueue vnode watch on a directory typically does NOT recursively
-            // watch subdirectories. Therefore, creating a file inside a subdirectory
-            // should NOT trigger a new event on the parent_dir_path watcher.
+            const file_in_subdir_path = renamed_sub_dir_path ++ "/file_in_subdir.txt";
+
             _ = try std.fs.cwd().createFile(file_in_subdir_path, .{});
             _ = try loop.run(.no_wait);
 
-            // Expect count to remain 1, as no new event for parent_dir_path is expected
-            // from changes within its subdirectories.
-            try testing.expectEqual(event.count, 1);
-            // Flags should still be 0 if no new event fired and it was reset.
+            try testing.expectEqual(event.count, 2);
             try testing.expectEqual(event.flags, 0);
         }
     };
