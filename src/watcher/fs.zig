@@ -4,11 +4,6 @@ const std = @import("std");
 const tree = @import("../tree.zig");
 const double = @import("../queue_double.zig");
 
-//NOTE:
-//pass the path name as an argument for the callbacks
-//it can me extracted from the inotify path section
-//or from the path that i will store inside the File Watcher
-
 pub fn FileSystem(comptime xev: type) type {
     if (xev.dynamic) return struct {};
     return switch (xev.backend) {
@@ -86,7 +81,7 @@ fn FileSystemDynamic(comptime xev: type) type {
 pub fn Callback(comptime xev: type, comptime T: type) type {
     return *const fn (
         userdata: ?*anyopaque,
-        completion: *T.Completion,
+        watcher: *T.Watcher,
         path: []const u8,
         result: u32,
     ) xev.CallbackAction;
@@ -96,7 +91,7 @@ pub fn NoopCallback(comptime xev: type, comptime T: type) Callback(xev, T) {
     return (struct {
         pub fn noopCallback(
             _: ?*anyopaque,
-            _: *T.Completion,
+            _: *T.Watcher,
             _: []const u8,
             _: u32,
         ) xev.CallbackAction {

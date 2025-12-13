@@ -3,78 +3,114 @@ const posix = std.posix;
 const linux = std.os.linux;
 const double = @import("../../queue_double.zig");
 const tree = @import("../../tree.zig");
-const pool = @import("../../pool.zig");
 const fspkg = @import("../fs.zig");
 const common = @import("../common.zig");
 const log = std.log.scoped(.fs);
-const assert = std.debug.assert;
-
-const CAPACITY = 100;
 
 pub fn FileSystem(comptime xev: type) type {
     return struct {
         const Callback = fspkg.Callback(xev, @This());
         const NoopCallback = fspkg.NoopCallback(xev, @This());
 
-        pub const Completion = struct {
-            next: ?*Completion = null,
-            prev: ?*Completion = null,
+        const State = enum(u1) {
+            dead = 0,
+            active = 1,
+        };
+
+        pub const Watcher = struct {
+            rb_node: tree.IntrusiveField(Watcher) = .{},
+
+            next: ?*Watcher = null,
+            prev: ?*Watcher = null,
 
             userdata: ?*anyopaque = null,
-
             callback: Callback = NoopCallback,
 
             wd: u32 = 0,
+            path: []const u8 = undefined,
 
             flags: packed struct {
                 state: State = .dead,
             } = .{},
 
-            const State = enum(u1) {
-                dead = 0,
+            watchers: double.Intrusive(Watcher) = .{},
 
-                active = 1,
-            };
-
-            pub fn state(self: Completion) xev.CompletionState {
+            pub fn state(self: Watcher) State {
                 return switch (self.flags.state) {
                     .dead => .dead,
                     .active => .active,
                 };
             }
 
-            pub fn invoke(self: *Completion, path: []const u8, res: u32) xev.CallbackAction {
+            pub fn invoke(self: *Watcher, path: []const u8, res: u32) xev.CallbackAction {
                 return self.callback(self.userdata, self, path, res);
             }
-        };
-        const FileWatcher = struct {
-            wd: u32,
-            path: []const u8 = undefined,
 
-            next: ?*FileWatcher = null,
-            rb_node: tree.IntrusiveField(FileWatcher) = .{},
-            completions: double.Intrusive(Completion) = .{},
-
-            pub fn compare(a: *FileWatcher, b: *FileWatcher) std.math.Order {
+            pub fn compare(a: *Watcher, b: *Watcher) std.math.Order {
                 if (a.wd > b.wd) return .gt;
                 if (a.wd < b.wd) return .lt;
                 return .eq;
             }
         };
 
-        const Pool = pool.Intrusive(FileWatcher);
-
         fd: posix.fd_t = -1,
         c: xev.Completion = .{},
-        buffer: [CAPACITY]FileWatcher = undefined,
 
-        pool: Pool = undefined,
-        tree: tree.Intrusive(FileWatcher, FileWatcher.compare) = .{},
+        tree: tree.Intrusive(Watcher, Watcher.compare) = .{},
 
         const Self = @This();
 
         pub fn init() Self {
             return .{};
+        }
+
+        pub fn deinit(self: *Self) void {
+            _ = self;
+            //WARN:
+            //i need to cancel the poll completion
+            // self.loop.cancel(self.c);
+            // posix.close(self.fd);
+        }
+
+        pub fn watch(self: *Self, loop: *xev.Loop, path: []const u8, watcher: *Watcher, comptime Userdata: type, userdata: ?*Userdata, comptime cb: *const fn (
+            ud: ?*Userdata,
+            watcher: *Watcher,
+            path: []const u8,
+            result: u32,
+        ) xev.CallbackAction) !void {
+            if (watcher.state() != .dead) {
+                return;
+            }
+
+            try self.start(loop);
+
+            const wd: u32 = @intCast(try posix.inotify_add_watch(self.fd, path, linux.IN.ATTRIB |
+                linux.IN.CREATE |
+                linux.IN.MODIFY |
+                linux.IN.DELETE |
+                linux.IN.DELETE_SELF |
+                linux.IN.MOVE_SELF |
+                linux.IN.MOVED_FROM |
+                linux.IN.MOVED_TO));
+
+            watcher.* = .{ .userdata = userdata, .callback = (struct {
+                fn callback(
+                    ud: ?*anyopaque,
+                    completion: *Watcher,
+                    _path: []const u8,
+                    result: u32,
+                ) xev.CallbackAction {
+                    return @call(.always_inline, cb, .{ common.userdataValue(Userdata, ud), completion, _path, result });
+                }
+            }).callback, .wd = wd };
+
+            if (self.tree.find(&watcher)) |w| {
+                w.watchers.push(watcher);
+            } else {
+                self.tree.insert(watcher);
+            }
+
+            watcher.flags.state = .active;
         }
 
         pub fn start(self: *Self, loop: *xev.Loop) !void {
@@ -85,8 +121,6 @@ pub fn FileSystem(comptime xev: type) type {
             const fd = try posix.inotify_init1(linux.IN.NONBLOCK | linux.IN.CLOEXEC);
 
             self.fd = fd;
-
-            self.pool = Pool.init(&self.buffer);
 
             const events: u32 = comptime switch (xev.backend) {
                 .io_uring => posix.POLL.IN,
@@ -102,12 +136,22 @@ pub fn FileSystem(comptime xev: type) type {
             loop.add(&self.c);
         }
 
-        pub fn deinit(self: *Self) void {
-            _ = self;
-            //WARN:
-            //i need to cancel the poll completion
-            // self.loop.cancel(self.c);
-            // posix.close(self.fd);
+        pub fn cancel(self: *Self, w: *Watcher) void {
+            if (self.tree.find(&w)) |watcher| {
+                if (watcher != w) {
+                    w.flags.state = .dead;
+                    watcher.watchers.remove(w);
+
+                    return;
+                }
+                if (watcher.watchers.pop()) |replace| {
+                    watcher.flags.state = .dead;
+                    self.tree.replace(watcher, replace) catch {};
+                } else {
+                    _ = self.tree.remove(w);
+                    posix.inotify_rm_watch(self.fd, @intCast(w.wd));
+                }
+            }
         }
 
         pub fn poll_callback(ud: ?*anyopaque, _: *xev.Loop, poll_c: *xev.Completion, res: xev.Result) xev.CallbackAction {
@@ -131,41 +175,53 @@ pub fn FileSystem(comptime xev: type) type {
                     while (offset < bytes_read) {
                         const event: *const linux.inotify_event = @ptrCast(@alignCast(&buffer[offset]));
 
-                        var temp_wd = FileWatcher{ .wd = @intCast(event.wd) };
-                        if (self.tree.find(&temp_wd)) |watcher| {
-                            var current = watcher.completions;
-                            watcher.completions = .{};
+                        var temp = Watcher{ .wd = @intCast(event.wd) };
+                        if (self.tree.find(&temp)) |watcher| {
+                            var path: []const u8 = undefined;
 
-                            while (current.pop()) |c| {
-                                var path: []const u8 = undefined;
+                            if (event.getName()) |p| {
+                                const w_path_len = watcher.path.len;
+                                const p_len = p.len;
+                                var _buffer: [std.fs.max_path_bytes]u8 = undefined;
 
-                                if (event.getName()) |p| {
-                                    const w_path_len = watcher.path.len;
-                                    const p_len = p.len;
-                                    var _buffer: [std.fs.max_path_bytes]u8 = undefined;
-
-                                    if (w_path_len + 1 + p_len > std.fs.max_path_bytes) {
-                                        @panic("Combined path exceeds maximum buffer length");
-                                    }
-
-                                    @memcpy(_buffer[0..w_path_len], watcher.path);
-                                    var current_idx: usize = w_path_len;
-
-                                    _buffer[current_idx] = '/';
-                                    current_idx += 1;
-
-                                    @memcpy(_buffer[current_idx .. current_idx + p_len], p);
-                                    current_idx += p_len;
-
-                                    path = _buffer[0..current_idx];
-                                } else {
-                                    path = watcher.path;
+                                if (w_path_len + 1 + p_len > std.fs.max_path_bytes) {
+                                    @panic("Combined path exceeds maximum buffer length");
                                 }
 
+                                @memcpy(_buffer[0..w_path_len], watcher.path);
+                                var current_idx: usize = w_path_len;
+
+                                _buffer[current_idx] = '/';
+                                current_idx += 1;
+
+                                @memcpy(_buffer[current_idx .. current_idx + p_len], p);
+                                current_idx += p_len;
+
+                                path = _buffer[0..current_idx];
+                            } else {
+                                path = watcher.path;
+                            }
+
+                            const action = watcher.invoke(path, event.mask);
+
+                            var current = watcher.watchers;
+                            watcher.watchers = .{};
+
+                            while (current.pop()) |c| {
                                 if (c.invoke(path, event.mask) == .rearm) {
-                                    watcher.completions.push(c);
+                                    watcher.watchers.push(c);
                                 } else {
-                                    c.*.flags.state = .dead;
+                                    c.flags.state = .dead;
+                                }
+                            }
+
+                            if (action == .disarm) {
+                                if (watcher.watchers.pop()) |replace| {
+                                    watcher.flags.state = .dead;
+                                    self.tree.replace(watcher, replace) catch {};
+                                } else {
+                                    _ = self.tree.remove(watcher);
+                                    posix.inotify_rm_watch(self.fd, @intCast(watcher.wd));
                                 }
                             }
                         } else {
@@ -179,64 +235,6 @@ pub fn FileSystem(comptime xev: type) type {
             } else |err| {
                 log.debug("error poll {}", .{err});
                 return .disarm;
-            }
-        }
-
-        pub fn watch(self: *Self, loop: *xev.Loop, path: []const u8, c: *Completion, comptime Userdata: type, userdata: ?*Userdata, comptime cb: *const fn (
-            ud: ?*Userdata,
-            completion: *Completion,
-            path: []const u8,
-            result: u32,
-        ) xev.CallbackAction) !void {
-            try self.start(loop);
-
-            const wd: u32 = @intCast(try posix.inotify_add_watch(self.fd, path, linux.IN.ATTRIB |
-                linux.IN.CREATE |
-                linux.IN.MODIFY |
-                linux.IN.DELETE |
-                linux.IN.DELETE_SELF |
-                linux.IN.MOVE_SELF |
-                linux.IN.MOVED_FROM |
-                linux.IN.MOVED_TO));
-
-            c.* = .{ .userdata = userdata, .callback = (struct {
-                fn callback(
-                    ud: ?*anyopaque,
-                    completion: *Completion,
-                    _path: []const u8,
-                    result: u32,
-                ) xev.CallbackAction {
-                    return @call(.always_inline, cb, .{ common.userdataValue(Userdata, ud), completion, _path, result });
-                }
-            }).callback, .wd = wd };
-
-            var temp_wd = FileWatcher{ .wd = wd };
-
-            if (self.tree.find(&temp_wd)) |w| {
-                w.completions.push(c);
-            } else {
-                const w = try self.pool.alloc();
-                w.* = .{ .wd = wd, .path = path };
-                w.completions.push(c);
-                self.tree.insert(w);
-            }
-
-            c.*.flags.state = .active;
-        }
-
-        pub fn cancel(self: *Self, c: *Completion) void {
-            var temp_wd = FileWatcher{ .wd = c.wd };
-
-            if (self.tree.find(&temp_wd)) |watcher| {
-                watcher.completions.remove(c);
-
-                c.*.flags.state = .dead;
-
-                if (watcher.completions.empty()) {
-                    _ = self.tree.remove(watcher);
-                    self.pool.free(watcher);
-                    posix.inotify_rm_watch(self.fd, @intCast(c.wd));
-                }
             }
         }
 
@@ -269,8 +267,7 @@ pub fn FileSystemTest(comptime xev: type) type {
             var counter: usize = 0;
 
             const custom_callback = struct {
-                fn invoke(ud: ?*usize, _: *FS.Completion, path: []const u8, _: u32) xev.CallbackAction {
-                    assert(std.mem.eql(u8, path, path1));
+                fn invoke(ud: ?*usize, _: *FS.Completion, _: []const u8, _: u32) xev.CallbackAction {
                     ud.?.* += 1;
                     return .rearm;
                 }

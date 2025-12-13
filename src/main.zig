@@ -98,7 +98,6 @@ test {
     _ = @import("queue.zig");
     _ = @import("queue_mpsc.zig");
     _ = @import("tree.zig");
-    _ = @import("pool.zig");
     _ = @import("queue_double.zig");
     _ = ThreadPool;
     _ = Dynamic;

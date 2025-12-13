@@ -24,7 +24,6 @@ pub fn Intrusive(
 
         root: ?*T = null,
 
-        /// Inserts a new element `v` into the tree.
         pub fn insert(self: *Self, v: *T) void {
             v.rb_node = .{};
 
@@ -56,8 +55,6 @@ pub fn Intrusive(
             self.insert_fixup(v);
         }
 
-        /// Finds an element `v` in the tree that compares equal to the provided `key`.
-        /// Returns the found element or `null` if not found.
         pub fn find(self: *Self, key: *T) ?*T {
             var current = self.root;
             while (current) |node| {
@@ -70,7 +67,6 @@ pub fn Intrusive(
             return null;
         }
 
-        /// Returns the minimum element in the tree, or `null` if the tree is empty.
         pub fn findMin(self: *Self) ?*T {
             var current = self.root;
             if (current == null) return null;
@@ -81,7 +77,6 @@ pub fn Intrusive(
             return current;
         }
 
-        /// Returns the maximum element in the tree, or `null` if the tree is empty.
         pub fn findMax(self: *Self) ?*T {
             var current = self.root;
             if (current == null) return null;
@@ -188,7 +183,7 @@ pub fn Intrusive(
                     }
                 }
             }
-            self.set_color(self.root.?, .Black); // Root must always be Black
+            self.set_color(self.root.?, .Black);
         }
 
         fn tree_minimum(_: *Self, node: *T) *T {
@@ -199,8 +194,6 @@ pub fn Intrusive(
             return current;
         }
 
-        /// Replaces the subtree rooted at `u` with the subtree rooted at `v`.
-        /// `v` can be null.
         fn transplant(self: *Self, u: *T, v: ?*T) void {
             if (u.rb_node.parent == null) {
                 self.root = v;
@@ -218,25 +211,23 @@ pub fn Intrusive(
             var current_x = x;
             var current_x_parent: *T = x_parent;
 
-            // The loop continues as long as x is a black node and not the root.
-            // If x is null, get_color(null) returns Black, so it's treated as a black node.
             while (current_x != self.root and self.get_color(current_x) == .Black) {
-                if (current_x == current_x_parent.rb_node.left) { // x is a left child
-                    var w = current_x_parent.rb_node.right.?; // w is x's sibling (guaranteed to exist as current_x_parent is not null)
+                if (current_x == current_x_parent.rb_node.left) {
+                    var w = current_x_parent.rb_node.right.?;
 
                     if (self.get_color(w) == .Red) {
                         // Case 1: Sibling w is Red
                         self.set_color(w, .Black);
                         self.set_color(current_x_parent, .Red);
                         self.rotate_left(current_x_parent);
-                        w = current_x_parent.rb_node.right.?; // Update w after rotation
+                        w = current_x_parent.rb_node.right.?;
                     }
                     // Sibling w is Black (or was made Black by Case 1)
                     if (self.get_color(w.rb_node.left) == .Black and self.get_color(w.rb_node.right) == .Black) {
                         // Case 2: Sibling w is Black and both its children are Black
                         self.set_color(w, .Red);
                         current_x = current_x_parent; // Move up the tree
-                        current_x_parent = current_x.?.rb_node.parent orelse break; // If current_x becomes root, its parent is null, break loop.
+                        current_x_parent = current_x.?.rb_node.parent orelse break;
                     } else {
                         if (self.get_color(w.rb_node.right) == .Black) {
                             // Case 3: Sibling w is Black, w's left child is Red, w's right child is Black
@@ -253,21 +244,21 @@ pub fn Intrusive(
                         current_x = self.root; // Terminate loop (rb-tree properties restored)
                     }
                 } else { // Symmetric case: x is a right child
-                    var w = current_x_parent.rb_node.left.?; // w is x's sibling
+                    var w = current_x_parent.rb_node.left.?;
 
                     if (self.get_color(w) == .Red) {
                         // Case 1: Sibling w is Red
                         self.set_color(w, .Black);
                         self.set_color(current_x_parent, .Red);
                         self.rotate_right(current_x_parent);
-                        w = current_x_parent.rb_node.left.?; // Update w after rotation
+                        w = current_x_parent.rb_node.left.?;
                     }
                     // Sibling w is Black
                     if (self.get_color(w.rb_node.right) == .Black and self.get_color(w.rb_node.left) == .Black) {
                         // Case 2: Sibling w is Black and both its children are Black
                         self.set_color(w, .Red);
                         current_x = current_x_parent; // Move up the tree
-                        current_x_parent = current_x.?.rb_node.parent orelse break; // If current_x becomes root, its parent is null, break loop.
+                        current_x_parent = current_x.?.rb_node.parent orelse break;
                     } else {
                         if (self.get_color(w.rb_node.left) == .Black) {
                             // Case 3: Sibling w is Black, w's right child is Red, w's left child is Black
@@ -281,23 +272,23 @@ pub fn Intrusive(
                         self.set_color(current_x_parent, .Black);
                         self.set_color(w.rb_node.left.?, .Black);
                         self.rotate_right(current_x_parent);
-                        current_x = self.root; // Terminate loop
+                        current_x = self.root;
                     }
                 }
             }
             if (current_x) |val_x| {
-                self.set_color(val_x, .Black); // Ensure the node that became x is black (if it's not null)
+                self.set_color(val_x, .Black);
             }
         }
 
         /// Removes an element `key` from the tree and returns the removed element, or `null` if not found.
         pub fn remove(self: *Self, key: *T) ?*T {
-            const z = self.find(key) orelse return null; // Node to be deleted
+            const z = self.find(key) orelse return null;
 
-            var y = z; // y is the node that will actually be removed from the tree structure
+            var y = z;
             var y_original_color = self.get_color(y);
-            var x: ?*T = null; // x is the node that replaces y (could be null)
-            var x_parent_for_fixup: *T = undefined; // Parent of x (or the parent of the null placeholder)
+            var x: ?*T = null;
+            var x_parent_for_fixup: *T = undefined;
 
             if (z.rb_node.left == null) {
                 // Case 1: z has no left child (or no children)
@@ -307,7 +298,7 @@ pub fn Intrusive(
                 // x_parent_for_fixup must refer to the node that becomes x's parent after transplant.
                 // If x is null, its parent is the node that was z's parent.
                 // If x is not null, its parent is also the node that was z's parent.
-                x_parent_for_fixup = z.rb_node.parent orelse z; // If z is root, x_parent_for_fixup is just z. This value is only used if x != self.root.
+                x_parent_for_fixup = z.rb_node.parent orelse z;
                 self.transplant(z, z.rb_node.right);
             } else if (z.rb_node.right == null) {
                 // Case 2: z has no right child
@@ -316,27 +307,27 @@ pub fn Intrusive(
                 self.transplant(z, z.rb_node.left);
             } else {
                 // Case 3: z has two children
-                y = self.tree_minimum(z.rb_node.right.?); // y is z's successor (leftmost in z's right subtree)
+                y = self.tree_minimum(z.rb_node.right.?);
                 y_original_color = self.get_color(y);
                 x = y.rb_node.right;
-                x_parent_for_fixup = y; // Temporarily, y is x's parent
+                x_parent_for_fixup = y;
 
                 if (y.rb_node.parent != z) {
                     // If y is not a direct child of z, y's original position needs to be handled
                     // x_parent_for_fixup will be y's actual parent
                     x_parent_for_fixup = y.rb_node.parent.?;
-                    self.transplant(y, y.rb_node.right); // Replace y with its right child (x)
-                    y.rb_node.right = z.rb_node.right; // y takes z's right child
+                    self.transplant(y, y.rb_node.right);
+                    y.rb_node.right = z.rb_node.right;
                     y.rb_node.right.?.rb_node.parent = y;
                 }
                 // If y.rb_node.parent == z, then y is z's direct right child.
                 // In this case, x_parent_for_fixup remains y, and x will take y's place.
                 // After transplanting z with y, y becomes z's replacement, and x's parent would be y.
 
-                self.transplant(z, y); // Replace z with y
-                y.rb_node.left = z.rb_node.left; // y takes z's left child
+                self.transplant(z, y);
+                y.rb_node.left = z.rb_node.left;
                 y.rb_node.left.?.rb_node.parent = y;
-                self.set_color(y, self.get_color(z)); // y inherits z's color
+                self.set_color(y, self.get_color(z));
             }
 
             // Only call fixup if a black node was removed (or replaced by a null black node)
@@ -353,6 +344,35 @@ pub fn Intrusive(
                 }
             }
             return z; // Return the removed node
+        }
+        pub fn replace(self: *Self, old: *T, new: *T) !void {
+            if (T.compare(old, new) != .eq) {
+                return error.NotEqual;
+            }
+            assert(new.rb_node.parent == null);
+            assert(new.rb_node.left == null);
+            assert(new.rb_node.right == null);
+
+            new.rb_node = old.rb_node;
+
+            if (old.rb_node.parent) |parent| {
+                if (parent.rb_node.left == old) {
+                    parent.rb_node.left = new;
+                } else {
+                    parent.rb_node.right = new;
+                }
+            } else {
+                self.root = new;
+            }
+
+            if (old.rb_node.left) |left_child| {
+                left_child.rb_node.parent = new;
+            }
+            if (old.rb_node.right) |right_child| {
+                right_child.rb_node.parent = new;
+            }
+
+            old.rb_node = .{};
         }
     };
 }
