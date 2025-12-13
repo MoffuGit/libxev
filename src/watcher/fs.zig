@@ -19,13 +19,22 @@ fn WatcherDynamic(comptime xev: type) type {
     return struct {
         const Self = @This();
 
-        pub const Union = xev.Union(&.{"Watcher"});
+        pub const Union = xev.TaggedUnion(&.{"Watcher"});
 
         value: Self.Union = @unionInit(
             Self.Union,
             @tagName(xev.candidates[xev.candidates.len - 1]),
             .{},
         ),
+
+        pub fn ensureTag(self: *Self, comptime tag: xev.Backend) void {
+            if (self.value == tag) return;
+            self.value = @unionInit(
+                Self.Union,
+                @tagName(tag),
+                .{},
+            );
+        }
     };
 }
 
@@ -68,6 +77,8 @@ fn FileSystemDynamic(comptime xev: type) type {
         ) xev.CallbackAction) !void {
             switch (xev.backend) {
                 inline else => |tag| {
+                    watcher.ensureTag(tag);
+
                     const api = (comptime xev.superset(tag)).Api();
                     const api_cb = (struct {
                         fn callback(
@@ -101,13 +112,12 @@ fn FileSystemDynamic(comptime xev: type) type {
         pub fn cancel(self: *Self, watcher: *xev.Watcher) void {
             switch (xev.backend) {
                 inline else => |tag| {
+                    watcher.ensureTag(tag);
+
                     @field(
                         self.backend,
                         @tagName(tag),
-                    ).cancel(@fieldParentPtr("value", @as(
-                        *xev.Watcher.WatcherUnion,
-                        @fieldParentPtr(@tagName(tag), watcher),
-                    )));
+                    ).cancel(&@field(watcher.value, @tagName(tag)));
                 },
             }
         }
@@ -142,6 +152,7 @@ pub fn NoopCallback(comptime xev: type, comptime T: type) Callback(xev, T) {
 
 pub fn FileSystemTest(comptime xev: type) type {
     return struct {
+        const linux = std.os.linux;
         const testing = std.testing;
         const FS = FileSystem(xev);
 
@@ -194,6 +205,208 @@ pub fn FileSystemTest(comptime xev: type) type {
             // Assert that the callback was invoked
             try testing.expectEqual(counter, 2);
             try testing.expectEqual(counter2, 1);
+        }
+
+        test "test inotify directory watcher" {
+            var loop = try xev.Loop.init(.{});
+            defer loop.deinit();
+
+            var fs = FS.init();
+            defer fs.deinit();
+
+            const dir_path = "test_directory_inotify";
+            try std.fs.cwd().makeDir(dir_path);
+            defer std.fs.cwd().deleteDir(dir_path) catch {};
+
+            const Event = struct { count: usize, flags: u32 };
+
+            var event = Event{ .count = 0, .flags = 0 };
+            const dir_callback_fn = struct {
+                fn invoke(evt: ?*Event, _: *FS.Watcher, _: []const u8, flags: u32) xev.CallbackAction {
+                    evt.?.flags = flags;
+                    evt.?.count += 1;
+                    return .rearm;
+                }
+            }.invoke;
+
+            var comp: FS.Watcher = .{};
+
+            try fs.watch(&loop, dir_path, &comp, Event, &event, dir_callback_fn);
+            _ = try loop.run(.no_wait);
+
+            try testing.expectEqual(event.count, 0);
+
+            const file1_path = dir_path ++ "/file1.txt";
+            _ = try std.fs.cwd().createFile(file1_path, .{});
+
+            _ = try loop.run(.once);
+            try testing.expectEqual(event.count, 1);
+            try testing.expectEqual(linux.IN.CREATE, event.flags);
+
+            std.fs.cwd().deleteFile(file1_path) catch {};
+
+            _ = try loop.run(.once);
+            try testing.expectEqual(event.count, 2);
+            try testing.expectEqual(linux.IN.DELETE, event.flags);
+
+            _ = try std.fs.cwd().createFile(file1_path, .{});
+            defer std.fs.cwd().deleteFile(file1_path) catch {};
+
+            _ = try loop.run(.once);
+            try testing.expectEqual(event.count, 3);
+            try testing.expectEqual(linux.IN.CREATE, event.flags);
+
+            var file_handle = try std.fs.cwd().openFile(file1_path, .{ .mode = .read_write });
+            defer file_handle.close();
+            _ = try file_handle.write("some content");
+            try file_handle.sync();
+
+            _ = try loop.run(.no_wait);
+            try testing.expectEqual(event.count, 4);
+            try testing.expectEqual(linux.IN.MODIFY, event.flags);
+        }
+
+        test "test inotify directory watcher for subdirectory events" {
+            var loop = try xev.Loop.init(.{});
+            defer loop.deinit();
+
+            var fs = FS.init();
+            defer fs.deinit();
+
+            const parent_dir_path = "test_parent_dir_inotify_subdir";
+            const sub_dir_path = parent_dir_path ++ "/test_subdir";
+            const file_in_subdir_path = sub_dir_path ++ "/file_in_subdir.txt";
+
+            try std.fs.cwd().makeDir(parent_dir_path);
+            defer std.fs.cwd().deleteTree(parent_dir_path) catch {};
+
+            const Event = struct { count: usize, flags: u32 };
+            var event = Event{ .count = 0, .flags = 0 };
+
+            const dir_callback_fn = struct {
+                fn invoke(evt: ?*Event, _: *FS.Watcher, _: []const u8, flags: u32) xev.CallbackAction {
+                    evt.?.flags = flags;
+                    evt.?.count += 1;
+                    return .rearm;
+                }
+            }.invoke;
+
+            var comp: FS.Watcher = .{};
+
+            try fs.watch(&loop, parent_dir_path, &comp, Event, &event, dir_callback_fn);
+            _ = try loop.run(.no_wait);
+
+            try testing.expectEqual(event.count, 0);
+
+            try std.fs.cwd().makeDir(sub_dir_path);
+            _ = try loop.run(.once);
+            try testing.expectEqual(event.count, 1);
+            try testing.expectEqual(event.flags, linux.IN.CREATE | linux.IN.ISDIR);
+
+            event.flags = 0;
+
+            _ = try std.fs.cwd().createFile(file_in_subdir_path, .{});
+            _ = try loop.run(.no_wait);
+
+            try testing.expectEqual(event.count, 1);
+            try testing.expectEqual(event.flags, 0);
+        }
+
+        test "test cancelling a primary watcher without replacement" {
+            var loop = try xev.Loop.init(.{});
+            defer loop.deinit();
+
+            var fs = FS.init();
+            defer fs.deinit();
+
+            const path = "test_path_cancel_no_replacement";
+            _ = try std.fs.cwd().createFile(path, .{});
+            defer std.fs.cwd().deleteFile(path) catch {};
+
+            var counter: usize = 0;
+            const callback_rearm = struct {
+                fn invoke(ud: ?*usize, _: *FS.Watcher, _: []const u8, _: u32) xev.CallbackAction {
+                    ud.?.* += 1;
+                    return .rearm;
+                }
+            }.invoke;
+
+            var watcher: FS.Watcher = .{};
+            try fs.watch(&loop, path, &watcher, usize, &counter, callback_rearm);
+
+            _ = try loop.run(.no_wait);
+
+            const file = try std.fs.cwd().openFile(path, .{ .mode = .write_only });
+            defer file.close();
+            _ = try file.write("event 1");
+            try file.sync();
+
+            _ = try loop.run(.no_wait);
+
+            try testing.expectEqual(counter, 1);
+
+            fs.cancel(&watcher);
+            _ = try loop.run(.no_wait);
+
+            _ = try file.write("event 2");
+            try file.sync();
+
+            _ = try loop.run(.no_wait);
+
+            try testing.expectEqual(counter, 1);
+
+            _ = try file.write("event 1");
+            try file.sync();
+
+            _ = try loop.run(.no_wait);
+
+            try testing.expectEqual(counter, 1);
+        }
+
+        test "test disarm a primary watcher without replacement" {
+            var loop = try xev.Loop.init(.{});
+            defer loop.deinit();
+
+            var fs = FS.init();
+            defer fs.deinit();
+
+            const path = "test_path_cancel_no_replacement";
+            _ = try std.fs.cwd().createFile(path, .{});
+            defer std.fs.cwd().deleteFile(path) catch {};
+
+            var counter: usize = 0;
+            const callback_rearm = struct {
+                fn invoke(ud: ?*usize, _: *FS.Watcher, _: []const u8, _: u32) xev.CallbackAction {
+                    ud.?.* += 1;
+                    return .disarm;
+                }
+            }.invoke;
+
+            var watcher: FS.Watcher = .{};
+            try fs.watch(&loop, path, &watcher, usize, &counter, callback_rearm);
+
+            _ = try loop.run(.no_wait);
+
+            const file = try std.fs.cwd().openFile(path, .{ .mode = .write_only });
+            defer file.close();
+            _ = try file.write("event 1");
+            try file.sync();
+
+            _ = try loop.run(.no_wait);
+
+            try testing.expectEqual(counter, 1);
+
+            _ = try file.write("event 2");
+            try file.sync();
+
+            _ = try loop.run(.no_wait);
+
+            try testing.expectEqual(counter, 1);
+
+            _ = try file.write("event 1");
+            try file.sync();
+
+            _ = try loop.run(.no_wait);
         }
     };
 }
