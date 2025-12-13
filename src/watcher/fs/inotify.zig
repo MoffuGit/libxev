@@ -9,6 +9,8 @@ const log = std.log.scoped(.fs);
 
 pub fn FileSystem(comptime xev: type) type {
     return struct {
+        const Self = @This();
+
         const Callback = fspkg.Callback(xev, @This());
         const NoopCallback = fspkg.NoopCallback(xev, @This());
 
@@ -26,7 +28,7 @@ pub fn FileSystem(comptime xev: type) type {
             userdata: ?*anyopaque = null,
             callback: Callback = NoopCallback,
 
-            wd: u32 = 0,
+            wd: i32 = 0,
             path: []const u8 = undefined,
 
             flags: packed struct {
@@ -55,10 +57,9 @@ pub fn FileSystem(comptime xev: type) type {
 
         fd: posix.fd_t = -1,
         c: xev.Completion = .{},
+        active: usize = 0,
 
         tree: tree.Intrusive(Watcher, Watcher.compare) = .{},
-
-        const Self = @This();
 
         pub fn init() Self {
             return .{};
@@ -84,33 +85,34 @@ pub fn FileSystem(comptime xev: type) type {
 
             try self.start(loop);
 
-            const wd: u32 = @intCast(try posix.inotify_add_watch(self.fd, path, linux.IN.ATTRIB |
+            const wd = try posix.inotify_add_watch(self.fd, path, linux.IN.ATTRIB |
                 linux.IN.CREATE |
                 linux.IN.MODIFY |
                 linux.IN.DELETE |
                 linux.IN.DELETE_SELF |
                 linux.IN.MOVE_SELF |
                 linux.IN.MOVED_FROM |
-                linux.IN.MOVED_TO));
+                linux.IN.MOVED_TO);
 
             watcher.* = .{ .userdata = userdata, .callback = (struct {
                 fn callback(
                     ud: ?*anyopaque,
-                    completion: *Watcher,
+                    _watcher: *Watcher,
                     _path: []const u8,
                     result: u32,
                 ) xev.CallbackAction {
-                    return @call(.always_inline, cb, .{ common.userdataValue(Userdata, ud), completion, _path, result });
+                    return @call(.always_inline, cb, .{ common.userdataValue(Userdata, ud), _watcher, _path, result });
                 }
             }).callback, .wd = wd };
 
-            if (self.tree.find(&watcher)) |w| {
+            if (self.tree.find(watcher)) |w| {
                 w.watchers.push(watcher);
             } else {
                 self.tree.insert(watcher);
             }
 
             watcher.flags.state = .active;
+            self.active += 1;
         }
 
         pub fn start(self: *Self, loop: *xev.Loop) !void {
@@ -137,19 +139,21 @@ pub fn FileSystem(comptime xev: type) type {
         }
 
         pub fn cancel(self: *Self, w: *Watcher) void {
-            if (self.tree.find(&w)) |watcher| {
+            if (self.tree.find(w)) |watcher| {
+                self.active -= 1;
+                watcher.flags.state = .dead;
+
                 if (watcher != w) {
-                    w.flags.state = .dead;
                     watcher.watchers.remove(w);
 
                     return;
                 }
+
                 if (watcher.watchers.pop()) |replace| {
-                    watcher.flags.state = .dead;
                     self.tree.replace(watcher, replace) catch {};
                 } else {
                     _ = self.tree.remove(w);
-                    posix.inotify_rm_watch(self.fd, @intCast(w.wd));
+                    posix.inotify_rm_watch(self.fd, w.wd);
                 }
             }
         }
@@ -175,7 +179,7 @@ pub fn FileSystem(comptime xev: type) type {
                     while (offset < bytes_read) {
                         const event: *const linux.inotify_event = @ptrCast(@alignCast(&buffer[offset]));
 
-                        var temp = Watcher{ .wd = @intCast(event.wd) };
+                        var temp = Watcher{ .wd = event.wd };
                         if (self.tree.find(&temp)) |watcher| {
                             var path: []const u8 = undefined;
 
@@ -212,20 +216,20 @@ pub fn FileSystem(comptime xev: type) type {
                                     watcher.watchers.push(c);
                                 } else {
                                     c.flags.state = .dead;
+                                    self.active -= 1;
                                 }
                             }
 
                             if (action == .disarm) {
+                                watcher.flags.state = .dead;
+                                self.active -= 1;
                                 if (watcher.watchers.pop()) |replace| {
-                                    watcher.flags.state = .dead;
                                     self.tree.replace(watcher, replace) catch {};
                                 } else {
                                     _ = self.tree.remove(watcher);
-                                    posix.inotify_rm_watch(self.fd, @intCast(watcher.wd));
+                                    posix.inotify_rm_watch(self.fd, watcher.wd);
                                 }
                             }
-                        } else {
-                            log.warn("inotify event for unknown wd: {}", .{event.wd});
                         }
 
                         offset += @sizeOf(linux.inotify_event) + event.len;
@@ -267,13 +271,13 @@ pub fn FileSystemTest(comptime xev: type) type {
             var counter: usize = 0;
 
             const custom_callback = struct {
-                fn invoke(ud: ?*usize, _: *FS.Completion, _: []const u8, _: u32) xev.CallbackAction {
+                fn invoke(ud: ?*usize, _: *FS.Watcher, _: []const u8, _: u32) xev.CallbackAction {
                     ud.?.* += 1;
                     return .rearm;
                 }
             }.invoke;
 
-            var comp: FS.Completion = .{};
+            var comp: FS.Watcher = .{};
 
             try fs.watch(&loop, path1, &comp, usize, &counter, custom_callback);
 
@@ -288,7 +292,7 @@ pub fn FileSystemTest(comptime xev: type) type {
 
             var counter2: usize = 0;
 
-            var comp2: FS.Completion = .{};
+            var comp2: FS.Watcher = .{};
 
             try fs.watch(&loop, path1, &comp2, usize, &counter2, custom_callback);
 
@@ -318,14 +322,14 @@ pub fn FileSystemTest(comptime xev: type) type {
 
             var event = Event{ .count = 0, .flags = 0 };
             const dir_callback_fn = struct {
-                fn invoke(evt: ?*Event, _: *FS.Completion, _: []const u8, flags: u32) xev.CallbackAction {
+                fn invoke(evt: ?*Event, _: *FS.Watcher, _: []const u8, flags: u32) xev.CallbackAction {
                     evt.?.flags = flags;
                     evt.?.count += 1;
                     return .rearm;
                 }
             }.invoke;
 
-            var comp: FS.Completion = .{};
+            var comp: FS.Watcher = .{};
 
             try fs.watch(&loop, dir_path, &comp, Event, &event, dir_callback_fn);
             _ = try loop.run(.no_wait);
@@ -379,14 +383,14 @@ pub fn FileSystemTest(comptime xev: type) type {
             var event = Event{ .count = 0, .flags = 0 };
 
             const dir_callback_fn = struct {
-                fn invoke(evt: ?*Event, _: *FS.Completion, _: []const u8, flags: u32) xev.CallbackAction {
+                fn invoke(evt: ?*Event, _: *FS.Watcher, _: []const u8, flags: u32) xev.CallbackAction {
                     evt.?.flags = flags;
                     evt.?.count += 1;
                     return .rearm;
                 }
             }.invoke;
 
-            var comp: FS.Completion = .{};
+            var comp: FS.Watcher = .{};
 
             try fs.watch(&loop, parent_dir_path, &comp, Event, &event, dir_callback_fn);
             _ = try loop.run(.no_wait);
@@ -405,6 +409,122 @@ pub fn FileSystemTest(comptime xev: type) type {
 
             try testing.expectEqual(event.count, 1);
             try testing.expectEqual(event.flags, 0);
+        }
+
+        test "test cancelling a primary watcher without replacement" {
+            var loop = try xev.Loop.init(.{});
+            defer loop.deinit();
+
+            var fs = FS.init();
+            defer fs.deinit();
+
+            const path = "test_path_cancel_no_replacement";
+            _ = try std.fs.cwd().createFile(path, .{});
+            defer std.fs.cwd().deleteFile(path) catch {};
+
+            var counter: usize = 0;
+            const callback_rearm = struct {
+                fn invoke(ud: ?*usize, _: *FS.Watcher, _: []const u8, _: u32) xev.CallbackAction {
+                    ud.?.* += 1;
+                    return .rearm;
+                }
+            }.invoke;
+
+            var watcher: FS.Watcher = .{};
+            try fs.watch(&loop, path, &watcher, usize, &counter, callback_rearm);
+            try testing.expectEqual(fs.active, 1);
+
+            _ = try loop.run(.no_wait);
+
+            const file = try std.fs.cwd().openFile(path, .{ .mode = .write_only });
+            defer file.close();
+            _ = try file.write("event 1");
+            try file.sync();
+
+            _ = try loop.run(.no_wait);
+
+            try testing.expectEqual(counter, 1);
+            try testing.expectEqual(watcher.flags.state, .active);
+
+            fs.cancel(&watcher);
+            _ = try loop.run(.no_wait);
+            try testing.expectEqual(fs.active, 0);
+
+            try testing.expectEqual(watcher.flags.state, .dead);
+
+            _ = try file.write("event 2");
+            try file.sync();
+
+            _ = try loop.run(.no_wait);
+
+            try testing.expectEqual(counter, 1);
+
+            _ = try file.write("event 1");
+            try file.sync();
+
+            _ = try loop.run(.no_wait);
+
+            try testing.expectEqual(counter, 1);
+            try testing.expectEqual(watcher.flags.state, .dead);
+
+            try testing.expectEqual(watcher.flags.state, .dead);
+            try testing.expectEqual(fs.active, 0);
+        }
+
+        test "test disarm a primary watcher without replacement" {
+            var loop = try xev.Loop.init(.{});
+            defer loop.deinit();
+
+            var fs = FS.init();
+            defer fs.deinit();
+
+            const path = "test_path_cancel_no_replacement";
+            _ = try std.fs.cwd().createFile(path, .{});
+            defer std.fs.cwd().deleteFile(path) catch {};
+
+            var counter: usize = 0;
+            const callback_rearm = struct {
+                fn invoke(ud: ?*usize, _: *FS.Watcher, _: []const u8, _: u32) xev.CallbackAction {
+                    ud.?.* += 1;
+                    return .disarm;
+                }
+            }.invoke;
+
+            var watcher: FS.Watcher = .{};
+            try fs.watch(&loop, path, &watcher, usize, &counter, callback_rearm);
+
+            _ = try loop.run(.no_wait);
+
+            const file = try std.fs.cwd().openFile(path, .{ .mode = .write_only });
+            defer file.close();
+            _ = try file.write("event 1");
+            try file.sync();
+
+            _ = try loop.run(.no_wait);
+
+            try testing.expectEqual(counter, 1);
+            try testing.expectEqual(watcher.flags.state, .dead);
+
+            try testing.expectEqual(watcher.flags.state, .dead);
+            try testing.expectEqual(fs.active, 0);
+
+            _ = try file.write("event 2");
+            try file.sync();
+
+            _ = try loop.run(.no_wait);
+
+            try testing.expectEqual(counter, 1);
+
+            _ = try file.write("event 1");
+            try file.sync();
+
+            _ = try loop.run(.no_wait);
+
+            try testing.expectEqual(counter, 1);
+            try testing.expectEqual(watcher.flags.state, .dead);
+
+            try testing.expectEqual(watcher.flags.state, .dead);
+            try testing.expectEqual(fs.active, 0);
         }
     };
 }

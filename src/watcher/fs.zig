@@ -5,7 +5,7 @@ const tree = @import("../tree.zig");
 const double = @import("../queue_double.zig");
 
 pub fn FileSystem(comptime xev: type) type {
-    if (xev.dynamic) return struct {};
+    if (xev.dynamic) return FileSystemDynamic(xev);
     return switch (xev.backend) {
         .io_uring,
         .epoll,
@@ -15,11 +15,26 @@ pub fn FileSystem(comptime xev: type) type {
     };
 }
 
+fn WatcherDynamic(comptime xev: type) type {
+    return struct {
+        const Self = @This();
+
+        pub const Union = xev.Union(&.{"Watcher"});
+
+        value: Self.Union = @unionInit(
+            Self.Union,
+            @tagName(xev.candidates[xev.candidates.len - 1]),
+            .{},
+        ),
+    };
+}
+
 fn FileSystemDynamic(comptime xev: type) type {
     return struct {
         const Self = @This();
 
         pub const Union = xev.Union(&.{"FileSystem"});
+        pub const Watcher = WatcherDynamic(xev);
 
         backend: Union,
 
@@ -45,29 +60,54 @@ fn FileSystemDynamic(comptime xev: type) type {
             }
         }
 
-        pub fn watch(self: *Self, loop: *xev.Loop, path: []const u8, c: *Self.Completion, comptime Userdata: type, userdata: ?*Userdata, comptime cb: *const fn (
+        pub fn watch(self: *Self, loop: *xev.Loop, path: []const u8, watcher: *xev.Watcher, comptime Userdata: type, userdata: ?*Userdata, comptime cb: *const fn (
             ud: ?*Userdata,
-            completion: *Self.Completion,
+            watcher: *xev.Watcher,
             path: []const u8,
             result: u32,
         ) xev.CallbackAction) !void {
             switch (xev.backend) {
                 inline else => |tag| {
+                    const api = (comptime xev.superset(tag)).Api();
+                    const api_cb = (struct {
+                        fn callback(
+                            ud: ?*Userdata,
+                            w: *api.Watcher,
+                            p: []const u8,
+                            result: u32,
+                        ) xev.CallbackAction {
+                            return cb(
+                                ud,
+                                @fieldParentPtr(
+                                    "value",
+                                    @as(
+                                        *xev.Watcher.Union,
+                                        @fieldParentPtr(@tagName(tag), w),
+                                    ),
+                                ),
+                                p,
+                                result,
+                            );
+                        }
+                    }.callback);
                     try @field(
                         self.backend,
                         @tagName(tag),
-                    ).watch(&@field(loop.backend, @tagName(tag)), path, c, Userdata, userdata, cb);
+                    ).watch(&@field(loop.backend, @tagName(tag)), path, &@field(watcher.value, @tagName(tag)), Userdata, userdata, api_cb);
                 },
             }
         }
 
-        pub fn cancel(self: *Self, c: *Self.Completion) void {
+        pub fn cancel(self: *Self, watcher: *xev.Watcher) void {
             switch (xev.backend) {
                 inline else => |tag| {
                     @field(
                         self.backend,
                         @tagName(tag),
-                    ).cancel(c);
+                    ).cancel(@fieldParentPtr("value", @as(
+                        *xev.Watcher.WatcherUnion,
+                        @fieldParentPtr(@tagName(tag), watcher),
+                    )));
                 },
             }
         }
@@ -120,15 +160,15 @@ pub fn FileSystemTest(comptime xev: type) type {
 
             var counter: usize = 0;
             const custom_callback = struct {
-                fn invoke(ud: ?*usize, _: *FS.Completion, _: u32) xev.CallbackAction {
+                fn invoke(ud: ?*usize, _: *FS.Watcher, _: []const u8, _: u32) xev.CallbackAction {
                     ud.?.* += 1;
                     return .rearm;
                 }
             }.invoke;
 
-            var comp: FS.Completion = .{};
+            var watcher: FS.Watcher = .{};
 
-            try fs.watch(&loop, path1, &comp, usize, &counter, custom_callback);
+            try fs.watch(&loop, path1, &watcher, usize, &counter, custom_callback);
 
             _ = try file.write("hello");
             try file.sync();
@@ -141,7 +181,7 @@ pub fn FileSystemTest(comptime xev: type) type {
 
             var counter2: usize = 0;
 
-            var comp2: FS.Completion = .{};
+            var comp2: FS.Watcher = .{};
 
             try fs.watch(&loop, path1, &comp2, usize, &counter2, custom_callback);
 
