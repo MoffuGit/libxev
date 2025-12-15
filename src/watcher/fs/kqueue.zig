@@ -15,19 +15,32 @@ pub fn FileSystem(comptime xev: type) type {
         const Callback = fspkg.Callback(xev, @This());
         const NoopCallback = fspkg.NoopCallback(xev, @This());
 
+        const CancelationCallback = fspkg.CancelationCallback(@This());
+        const NoopCancelation = fspkg.NoopCancelation(@This());
+
         const State = enum(u1) {
             dead = 0,
             active = 1,
+        };
+
+        const Cancelation = struct {
+            c: xev.Completion = .{},
+            userdata: ?*anyopaque = null,
+            callback: CancelationCallback = NoopCancelation,
+
+            pub fn invoke(self: *Cancelation, w: *Watcher) void {
+                self.callback(self.userdata, w);
+            }
         };
 
         pub const Monitor = struct {
             const FLAGS = std.c.NOTE.WRITE | std.c.NOTE.DELETE | std.c.NOTE.ATTRIB | std.c.NOTE.EXTEND | std.c.NOTE.LINK | std.c.NOTE.RENAME;
             fd: i32 = -1,
 
-            vnode_c: xev.Completion = .{},
-            cancel_c: xev.Completion = .{},
+            c: xev.Completion = .{},
 
             watchers: double.Intrusive(Watcher) = .{},
+            cancelation: Cancelation = .{},
 
             pub fn state(self: Monitor) State {
                 return if (self.fd == -1) .dead else .active;
@@ -44,7 +57,7 @@ pub fn FileSystem(comptime xev: type) type {
             }
 
             pub fn start(self: *Monitor, loop: *xev.Loop, w: *Watcher) void {
-                self.vnode_c = .{
+                self.c = .{
                     .op = .{
                         .vnode = .{
                             .fd = self.fd,
@@ -54,12 +67,13 @@ pub fn FileSystem(comptime xev: type) type {
                     .userdata = w,
                     .callback = vnode_callback,
                 };
-                self.cancel_c = .{ .op = .{ .cancel = .{ .c = &self.vnode_c } }, .userdata = w, .callback = cancel_callback };
-                loop.add(&self.vnode_c);
+                loop.add(&self.c);
             }
 
-            pub fn cancel(self: *Monitor, loop: *xev.Loop) void {
-                loop.add(&self.cancel_c);
+            pub fn cancel(self: *Monitor, loop: *xev.Loop, w: *Watcher) void {
+                self.cancelation.c =
+                    .{ .op = .{ .cancel = .{ .c = &self.c } }, .userdata = w, .callback = cancel_callback };
+                loop.add(&self.cancelation.c);
             }
 
             pub fn deinit(self: *Monitor) void {
@@ -172,14 +186,44 @@ pub fn FileSystem(comptime xev: type) type {
 
                     w.monitor.fd = -1;
 
-                    w.flags.state = .dead;
+                    self.tree.replace(w, replace) catch {};
+                } else {
+                    _ = self.tree.remove(w);
+                }
+
+                m.cancel(loop, w);
+            }
+        }
+
+        pub fn cancelWithCallback(self: *Self, loop: *xev.Loop, watcher: *Watcher, comptime Userdata: type, userdata: ?*Userdata, comptime cb: *const fn (ud: ?*Userdata, w: *Watcher) void) void {
+            if (self.tree.find(watcher)) |w| {
+                const m = &w.monitor;
+
+                m.cancelation = .{ .userdata = userdata, .callback = (struct {
+                    pub fn callback(ud: ?*anyopaque, inner_w: *Watcher) void {
+                        @call(.always_inline, cb, .{ common.userdataValue(Userdata, ud), inner_w });
+                    }
+                }.callback) };
+
+                if (watcher != w) {
+                    watcher.*.flags.state = .dead;
                     self.active -= 1;
+                    m.watchers.remove(watcher);
+                    m.cancelation.invoke(w);
+                    return;
+                }
+
+                if (m.watchers.pop()) |replace| {
+                    replace.monitor = Monitor.initFd(m.fd);
+
+                    w.monitor.fd = -1;
 
                     self.tree.replace(w, replace) catch {};
                 } else {
                     _ = self.tree.remove(w);
-                    m.cancel(loop);
                 }
+
+                m.cancel(loop, w);
             }
         }
 
@@ -192,6 +236,8 @@ pub fn FileSystem(comptime xev: type) type {
                 posix.close(watcher.monitor.fd);
                 watcher.monitor.fd = -1;
             }
+
+            watcher.monitor.cancelation.invoke(watcher);
 
             return .disarm;
         }
@@ -585,6 +631,188 @@ pub fn FileSystemTest(comptime xev: type) type {
             _ = try loop.run(.until_done);
 
             try testing.expectEqual(counter, 1);
+        }
+
+        test "test cancelling a primary watcher with a custom callback" {
+            var loop = try xev.Loop.init(.{});
+            defer loop.deinit();
+
+            var fs = FS.init();
+            defer fs.deinit();
+
+            const path = "test_path_cancel_with_callback";
+            _ = try std.fs.cwd().createFile(path, .{});
+            defer std.fs.cwd().deleteFile(path) catch {};
+
+            var watch_counter: usize = 0;
+            const watch_callback_rearm = struct {
+                fn invoke(ud: ?*usize, _: *FS.Watcher, _: []const u8, _: u32) xev.CallbackAction {
+                    ud.?.* += 1;
+                    return .rearm;
+                }
+            }.invoke;
+
+            var cancel: bool = false;
+
+            const cancel_callback = struct {
+                fn invoke(ud: ?*bool, w: *FS.Watcher) void {
+                    _ = w;
+                    ud.?.* = true;
+                }
+            }.invoke;
+
+            var watcher: FS.Watcher = .{};
+            try fs.watch(&loop, path, &watcher, usize, &watch_counter, watch_callback_rearm);
+            try testing.expectEqual(fs.active, 1);
+            try testing.expectEqual(watcher.flags.state, .active);
+
+            _ = try loop.run(.no_wait);
+
+            // Trigger an event to ensure the watcher is active and registered
+            const file = try std.fs.cwd().openFile(path, .{ .mode = .write_only });
+            defer file.close();
+            _ = try file.write("event 1");
+            try file.sync();
+
+            _ = try loop.run(.once);
+            try testing.expectEqual(watch_counter, 1);
+            try testing.expectEqual(watcher.flags.state, .active);
+
+            fs.cancelWithCallback(&loop, &watcher, bool, &cancel, cancel_callback);
+            _ = try loop.run(.no_wait);
+
+            _ = try loop.run(.once);
+
+            try testing.expectEqual(cancel, true);
+            try testing.expectEqual(fs.active, 0);
+            try testing.expectEqual(watcher.flags.state, .dead);
+            try testing.expectEqual(watcher.monitor.fd, -1); // Monitor's FD should be closed
+
+            // Verify no further watch events occur after cancellation
+            _ = try file.write("event 2 after cancel");
+            try file.sync();
+            _ = try loop.run(.once);
+            try testing.expectEqual(watch_counter, 1); // Should not increment further
+        }
+
+        test "test multiple watchers cancelation" {
+            var loop = try xev.Loop.init(.{});
+            defer loop.deinit();
+
+            var fs = FS.init();
+            defer fs.deinit();
+
+            const path = "test_multiple_watchers_path";
+            const file = try std.fs.cwd().createFile(path, .{});
+            defer std.fs.cwd().deleteFile(path) catch {};
+
+            var event_counter_1: usize = 0;
+            var event_counter_2: usize = 0;
+            var event_counter_3: usize = 0;
+
+            const watch_callback_rearm = struct {
+                fn invoke(ud: ?*usize, _: *FS.Watcher, _: []const u8, _: u32) xev.CallbackAction {
+                    ud.?.* += 1;
+                    return .rearm;
+                }
+            }.invoke;
+
+            var cancel_flag_1: bool = false;
+            var cancel_flag_3: bool = false;
+
+            const simple_cancel_callback = struct {
+                fn invoke(ud: ?*bool, w: *FS.Watcher) void {
+                    _ = w;
+                    ud.?.* = true;
+                }
+            }.invoke;
+
+            var watcher_1: FS.Watcher = .{};
+            try fs.watch(&loop, path, &watcher_1, usize, &event_counter_1, watch_callback_rearm);
+            try testing.expectEqual(fs.active, 1);
+            try testing.expectEqual(watcher_1.flags.state, .active);
+
+            _ = try loop.run(.no_wait);
+
+            _ = try file.write("event 1a");
+            try file.sync();
+            _ = try loop.run(.once);
+
+            try testing.expectEqual(event_counter_1, 1);
+            try testing.expectEqual(event_counter_2, 0);
+            try testing.expectEqual(event_counter_3, 0);
+            try testing.expectEqual(watcher_1.flags.state, .active);
+
+            var watcher_2: FS.Watcher = .{};
+            try fs.watch(&loop, path, &watcher_2, usize, &event_counter_2, watch_callback_rearm);
+            try testing.expectEqual(fs.active, 2);
+            try testing.expectEqual(watcher_2.flags.state, .active);
+            try testing.expectEqual(event_counter_2, 0);
+
+            var watcher_3: FS.Watcher = .{};
+            try fs.watch(&loop, path, &watcher_3, usize, &event_counter_3, watch_callback_rearm);
+
+            try testing.expectEqual(fs.active, 3);
+            try testing.expectEqual(watcher_3.flags.state, .active);
+            try testing.expectEqual(event_counter_3, 0);
+
+            _ = try file.write("event after all added");
+            try file.sync();
+            _ = try loop.run(.once);
+
+            try testing.expectEqual(event_counter_1, 2);
+            try testing.expectEqual(event_counter_2, 1);
+            try testing.expectEqual(event_counter_3, 1);
+
+            fs.cancelWithCallback(&loop, &watcher_3, bool, &cancel_flag_3, simple_cancel_callback);
+
+            try testing.expectEqual(cancel_flag_3, true);
+            try testing.expectEqual(fs.active, 2);
+            try testing.expectEqual(watcher_3.flags.state, .dead);
+
+            _ = try file.write("event after cancel 3");
+            try file.sync();
+
+            _ = try loop.run(.once);
+
+            try testing.expectEqual(event_counter_1, 3);
+            try testing.expectEqual(event_counter_2, 2);
+            try testing.expectEqual(event_counter_3, 1);
+
+            fs.cancelWithCallback(&loop, &watcher_1, bool, &cancel_flag_1, simple_cancel_callback);
+
+            _ = try loop.run(.no_wait);
+
+            try testing.expectEqual(event_counter_1, 3);
+            try testing.expectEqual(cancel_flag_1, true);
+            try testing.expectEqual(fs.active, 1);
+            try testing.expectEqual(watcher_1.flags.state, .dead);
+            try testing.expectEqual(watcher_1.monitor.fd, -1);
+
+            _ = try file.write("event after cancel 1");
+            try file.sync();
+
+            _ = try loop.run(.no_wait);
+
+            try testing.expectEqual(event_counter_1, 3);
+            try testing.expectEqual(event_counter_2, 2);
+            try testing.expectEqual(event_counter_3, 1);
+            try testing.expectEqual(watcher_2.flags.state, .active);
+
+            fs.cancel(&loop, &watcher_2);
+            _ = try loop.run(.no_wait);
+
+            try testing.expectEqual(fs.active, 0);
+            try testing.expectEqual(watcher_2.flags.state, .dead);
+            try testing.expectEqual(watcher_2.monitor.fd, -1);
+
+            _ = try file.write("event after cancel 2");
+            try file.sync();
+
+            _ = try loop.run(.no_wait);
+            try testing.expectEqual(event_counter_1, 3);
+            try testing.expectEqual(event_counter_2, 2);
+            try testing.expectEqual(event_counter_3, 1);
         }
     };
 }

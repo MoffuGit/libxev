@@ -150,6 +150,22 @@ pub fn NoopCallback(comptime xev: type, comptime T: type) Callback(xev, T) {
     }).noopCallback;
 }
 
+pub fn CancelationCallback(comptime T: type) type {
+    return *const fn (
+        userdata: ?*anyopaque,
+        watcher: *T.Watcher,
+    ) void;
+}
+
+pub fn NoopCancelation(comptime T: type) CancelationCallback(T) {
+    return (struct {
+        pub fn noopCallback(
+            _: ?*anyopaque,
+            _: *T.Watcher,
+        ) void {}
+    }).noopCallback;
+}
+
 pub fn FileSystemTest(comptime xev: type) type {
     return struct {
         const linux = std.os.linux;
