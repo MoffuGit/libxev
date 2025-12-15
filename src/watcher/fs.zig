@@ -69,7 +69,16 @@ fn FileSystemDynamic(comptime xev: type) type {
             }
         }
 
-        pub fn watch(self: *Self, loop: *xev.Loop, path: []const u8, watcher: *xev.Watcher, comptime Userdata: type, userdata: ?*Userdata, comptime cb: *const fn (
+        pub fn start(self: *Self, loop: *xev.Loop) !void {
+            try switch (xev.backend) {
+                inline else => |tag| @field(
+                    self.backend,
+                    @tagName(tag),
+                ).start(&@field(loop.backend, @tagName(tag))),
+            };
+        }
+
+        pub fn watch(self: *Self, path: []const u8, watcher: *xev.Watcher, comptime Userdata: type, userdata: ?*Userdata, comptime cb: *const fn (
             ud: ?*Userdata,
             watcher: *xev.Watcher,
             path: []const u8,
@@ -104,7 +113,7 @@ fn FileSystemDynamic(comptime xev: type) type {
                     try @field(
                         self.backend,
                         @tagName(tag),
-                    ).watch(&@field(loop.backend, @tagName(tag)), path, &@field(watcher.value, @tagName(tag)), Userdata, userdata, api_cb);
+                    ).watch(path, &@field(watcher.value, @tagName(tag)), Userdata, userdata, api_cb);
                 },
             }
         }
@@ -118,6 +127,38 @@ fn FileSystemDynamic(comptime xev: type) type {
                         self.backend,
                         @tagName(tag),
                     ).cancel(&@field(watcher.value, @tagName(tag)));
+                },
+            }
+        }
+
+        pub fn cancelWithCallback(self: *Self, watcher: *Watcher, comptime Userdata: type, userdata: ?*Userdata, comptime cb: *const fn (ud: ?*Userdata, w: *Watcher) void) void {
+            switch (xev.backend) {
+                inline else => |tag| {
+                    watcher.ensureTag(tag);
+
+                    const api = (comptime xev.superset(tag)).Api();
+                    const api_cb = (struct {
+                        fn callback(
+                            ud: ?*Userdata,
+                            w: *api.Watcher,
+                        ) xev.CallbackAction {
+                            return cb(
+                                ud,
+                                @fieldParentPtr(
+                                    "value",
+                                    @as(
+                                        *xev.Watcher.Union,
+                                        @fieldParentPtr(@tagName(tag), w),
+                                    ),
+                                ),
+                            );
+                        }
+                    }.callback);
+
+                    @field(
+                        self.backend,
+                        @tagName(tag),
+                    ).cancelWithCallback(&@field(watcher.value, @tagName(tag)), Userdata, userdata, api_cb);
                 },
             }
         }
@@ -178,6 +219,7 @@ pub fn FileSystemTest(comptime xev: type) type {
 
             var fs = FS.init();
             defer fs.deinit();
+            try fs.start(&loop);
 
             _ = try loop.run(.no_wait);
 
@@ -195,7 +237,7 @@ pub fn FileSystemTest(comptime xev: type) type {
 
             var watcher: FS.Watcher = .{};
 
-            try fs.watch(&loop, path1, &watcher, usize, &counter, custom_callback);
+            try fs.watch(path1, &watcher, usize, &counter, custom_callback);
 
             _ = try file.write("hello");
             try file.sync();
@@ -210,7 +252,7 @@ pub fn FileSystemTest(comptime xev: type) type {
 
             var comp2: FS.Watcher = .{};
 
-            try fs.watch(&loop, path1, &comp2, usize, &counter2, custom_callback);
+            try fs.watch(path1, &comp2, usize, &counter2, custom_callback);
 
             _ = try file.write("hello");
             try file.sync();
@@ -229,6 +271,7 @@ pub fn FileSystemTest(comptime xev: type) type {
 
             var fs = FS.init();
             defer fs.deinit();
+            try fs.start(&loop);
 
             const dir_path = "test_directory_inotify";
             try std.fs.cwd().makeDir(dir_path);
@@ -247,7 +290,7 @@ pub fn FileSystemTest(comptime xev: type) type {
 
             var comp: FS.Watcher = .{};
 
-            try fs.watch(&loop, dir_path, &comp, Event, &event, dir_callback_fn);
+            try fs.watch(dir_path, &comp, Event, &event, dir_callback_fn);
             _ = try loop.run(.no_wait);
 
             try testing.expectEqual(event.count, 0);
@@ -288,6 +331,7 @@ pub fn FileSystemTest(comptime xev: type) type {
 
             var fs = FS.init();
             defer fs.deinit();
+            try fs.start(&loop);
 
             const parent_dir_path = "test_parent_dir_inotify_subdir";
             const sub_dir_path = parent_dir_path ++ "/test_subdir";
@@ -309,7 +353,7 @@ pub fn FileSystemTest(comptime xev: type) type {
 
             var comp: FS.Watcher = .{};
 
-            try fs.watch(&loop, parent_dir_path, &comp, Event, &event, dir_callback_fn);
+            try fs.watch(parent_dir_path, &comp, Event, &event, dir_callback_fn);
             _ = try loop.run(.no_wait);
 
             try testing.expectEqual(event.count, 0);
@@ -334,6 +378,7 @@ pub fn FileSystemTest(comptime xev: type) type {
 
             var fs = FS.init();
             defer fs.deinit();
+            try fs.start(&loop);
 
             const path = "test_path_cancel_no_replacement";
             _ = try std.fs.cwd().createFile(path, .{});
@@ -348,7 +393,7 @@ pub fn FileSystemTest(comptime xev: type) type {
             }.invoke;
 
             var watcher: FS.Watcher = .{};
-            try fs.watch(&loop, path, &watcher, usize, &counter, callback_rearm);
+            try fs.watch(path, &watcher, usize, &counter, callback_rearm);
 
             _ = try loop.run(.no_wait);
 
@@ -385,6 +430,7 @@ pub fn FileSystemTest(comptime xev: type) type {
 
             var fs = FS.init();
             defer fs.deinit();
+            try fs.start(&loop);
 
             const path = "test_path_cancel_no_replacement";
             _ = try std.fs.cwd().createFile(path, .{});
@@ -399,7 +445,7 @@ pub fn FileSystemTest(comptime xev: type) type {
             }.invoke;
 
             var watcher: FS.Watcher = .{};
-            try fs.watch(&loop, path, &watcher, usize, &counter, callback_rearm);
+            try fs.watch(path, &watcher, usize, &counter, callback_rearm);
 
             _ = try loop.run(.no_wait);
 
