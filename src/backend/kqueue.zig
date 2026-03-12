@@ -25,7 +25,7 @@ const log = std.log.scoped(.libxev_kqueue);
 pub fn available() bool {
     return switch (builtin.os.tag) {
         // macOS uses kqueue
-        .ios, .macos => true,
+        .ios, .macos, .visionos => true,
 
         // BSDs use kqueue, but we only test on FreeBSD for now.
         // kqueue isn't exactly the same here as it is on Apple platforms.
@@ -40,7 +40,7 @@ pub fn available() bool {
 }
 
 pub const NOTE_EXIT_FLAGS = switch (builtin.os.tag) {
-    .ios, .macos => std.c.NOTE.EXIT | std.c.NOTE.EXITSTATUS,
+    .ios, .macos, .visionos => std.c.NOTE.EXIT | std.c.NOTE.EXITSTATUS,
     .freebsd => std.c.NOTE.EXIT,
     else => @compileError("kqueue not supported yet for target OS"),
 };
@@ -198,7 +198,7 @@ pub const Loop = struct {
                     // If we're deleting then we create a deletion event and
                     // queue the completion to notify cancellation.
                     .deleting => if (c.kevent()) |ev| {
-                        const ecanceled = -1 * @as(i32, @intCast(@intFromEnum(posix.system.E.CANCELED)));
+                        const ecanceled = errno_to_result(.CANCELED);
                         c.result = c.syscall_result(ecanceled);
                         c.flags.state = .dead;
                         self.completions.push(c);
@@ -659,7 +659,7 @@ pub const Loop = struct {
         }
     }
 
-    fn timer_next(self: Loop, next_ms: u64) posix.timespec {
+    fn timer_next(self: *Loop, next_ms: u64) posix.timespec {
         // Get the timestamp of the absolute time that we'll execute this timer.
         // There are lots of failure scenarios here in math. If we see any
         // of them we just use the maximum value.
@@ -674,6 +674,8 @@ pub const Loop = struct {
             isize,
             (next_ms % std.time.ms_per_s) * std.time.ns_per_ms,
         ) orelse return max;
+
+        self.update_now();
 
         return .{
             .sec = std.math.add(isize, self.cached_now.sec, next_s) catch
@@ -743,7 +745,7 @@ pub const Loop = struct {
                         },
 
                         // Any other error we report
-                        else => break :action .{ .result = result },
+                        else => |errno| break :action .{ .result = errno_to_result(errno) },
                     }
                 }
             },
@@ -810,7 +812,11 @@ pub const Loop = struct {
                     .both => posix.SHUT.RDWR,
                 });
 
-                break :action .{ .result = result };
+                if (result >= 0) {
+                    break :action .{ .result = result };
+                } else {
+                    break :action .{ .result = errno_to_result(posix.errno(result)) };
+                }
             },
 
             .close => |v| action: {
@@ -868,7 +874,7 @@ pub const Loop = struct {
                     // We use EPERM as a way to note there is no thread
                     // pool. We can change this in the future if there is
                     // a better choice.
-                    const eperm = -1 * @as(i32, @intCast(@intFromEnum(posix.system.E.PERM)));
+                    const eperm = errno_to_result(.PERM);
                     c.result = c.syscall_result(eperm);
                     self.completions.push(c);
                     return false;
@@ -959,7 +965,7 @@ pub const Loop = struct {
         // Add to our completion queue
         c.task_loop.thread_pool_completions.push(c);
 
-        if (comptime builtin.target.os.tag == .macos) {
+        if (comptime builtin.target.os.tag.isDarwin()) {
             // Wake up our main loop
             c.task_loop.wakeup() catch {};
         }
@@ -1075,7 +1081,7 @@ pub const Completion = struct {
                 .udata = @intFromPtr(self),
             }),
 
-            .machport => if (comptime builtin.os.tag != .macos) return null else kevent: {
+            .machport => if (comptime !builtin.os.tag.isDarwin()) return null else kevent: {
                 // We can't use |*v| above because it crahses the Zig
                 // compiler (as of 0.11.0-dev.1413). We can retry another time.
                 const v = &self.op.machport;
@@ -1418,6 +1424,7 @@ pub const Completion = struct {
                 .shutdown = switch (errno) {
                     .SUCCESS => {},
                     .CANCELED => error.Canceled,
+                    .NOTCONN => error.SocketNotConnected,
                     else => |err| posix.unexpectedErrno(err),
                 },
             },
@@ -1840,7 +1847,7 @@ const Timer = struct {
 /// Kevent is either kevent_s or kevent64_s depending on the target platform.
 /// This lets us support both Mac and non-Mac platforms.
 const Kevent = switch (builtin.os.tag) {
-    .ios, .macos => posix.system.kevent64_s,
+    .ios, .macos, .visionos => posix.system.kevent64_s,
     .freebsd => std.c.Kevent,
     else => @compileError("kqueue not supported yet for target OS"),
 };
@@ -1885,6 +1892,11 @@ fn kevent_syscall(
             else => unreachable,
         }
     }
+}
+
+/// Converts a posix errno to the negative i32 format expected by syscall_result.
+inline fn errno_to_result(errno: posix.E) i32 {
+    return -@as(i32, @intCast(@intFromEnum(errno)));
 }
 
 /// kevent_init initializes a Kevent from an posix.Kevent. This is used when
@@ -2702,6 +2714,116 @@ test "kqueue: mach port" {
     // Tick so we submit... should not call since we never sent.
     try loop.run(.no_wait);
     try testing.expect(!called);
+}
+
+test "kqueue: timer armed from delayed callback must not fire early" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+
+    const testing = std.testing;
+
+    const send_delay_ms: u64 = 50;
+    const timer_delay_ms: u64 = 20;
+
+    var loop = try Loop.init(.{});
+    defer loop.deinit();
+
+    // Allocate the port used to wake the loop after a delayed send.
+    const mach_self = posix.system.mach_task_self();
+    var mach_port: posix.system.mach_port_name_t = undefined;
+    try testing.expectEqual(
+        darwin.KernE.SUCCESS,
+        darwin.getKernError(posix.system.mach_port_allocate(
+            mach_self,
+            @intFromEnum(posix.system.MACH_PORT_RIGHT.RECEIVE),
+            &mach_port,
+        )),
+    );
+    defer _ = posix.system.mach_port_deallocate(mach_self, mach_port);
+
+    const State = struct {
+        timer_started_ns: i128 = 0,
+        timer_fired_ns: i128 = 0,
+        timer_trigger: ?TimerTrigger = null,
+        timer_completion: Completion = undefined,
+    };
+
+    var state: State = .{};
+
+    const timer_cb: Callback = (struct {
+        fn callback(
+            ud: ?*anyopaque,
+            _: *Loop,
+            _: *Completion,
+            r: Result,
+        ) CallbackAction {
+            const s: *State = @ptrCast(@alignCast(ud.?));
+            s.timer_fired_ns = std.time.nanoTimestamp();
+            s.timer_trigger = r.timer catch unreachable;
+            return .disarm;
+        }
+    }).callback;
+
+    var c_wait: Completion = .{
+        .op = .{
+            .machport = .{
+                .port = mach_port,
+                .buffer = .{ .array = undefined },
+            },
+        },
+
+        .userdata = &state,
+        .callback = (struct {
+            fn callback(
+                ud: ?*anyopaque,
+                l: *Loop,
+                _: *Completion,
+                r: Result,
+            ) CallbackAction {
+                _ = r.machport catch unreachable;
+                const s: *State = @ptrCast(@alignCast(ud.?));
+                s.timer_started_ns = std.time.nanoTimestamp();
+                l.timer(&s.timer_completion, timer_delay_ms, s, timer_cb);
+                return .disarm;
+            }
+        }).callback,
+    };
+    loop.add(&c_wait);
+
+    // Send to the mach port only after the loop has been blocked for a while.
+    const sender = try std.Thread.spawn(.{}, (struct {
+        fn run(port: posix.system.mach_port_name_t) void {
+            std.Thread.sleep(send_delay_ms * std.time.ns_per_ms);
+
+            var msg: darwin.mach_msg_header_t = .{
+                .msgh_bits = @intFromEnum(posix.system.MACH_MSG_TYPE.MAKE_SEND_ONCE),
+                .msgh_size = @sizeOf(darwin.mach_msg_header_t),
+                .msgh_remote_port = port,
+                .msgh_local_port = darwin.MACH_PORT_NULL,
+                .msgh_voucher_port = undefined,
+                .msgh_id = undefined,
+            };
+
+            const rc = darwin.mach_msg(
+                &msg,
+                darwin.MACH_SEND_MSG,
+                msg.msgh_size,
+                0,
+                darwin.MACH_PORT_NULL,
+                darwin.MACH_MSG_TIMEOUT_NONE,
+                darwin.MACH_PORT_NULL,
+            );
+            assert(darwin.getMachMsgError(rc) == darwin.MachMsgE.SUCCESS);
+        }
+    }).run, .{mach_port});
+    defer sender.join();
+
+    try loop.run(.until_done);
+
+    try testing.expect(state.timer_trigger.? == .expiration);
+
+    const elapsed_ns = state.timer_fired_ns - state.timer_started_ns;
+    const elapsed_ms: i128 = @divFloor(elapsed_ns, std.time.ns_per_ms);
+    try testing.expect(elapsed_ms >= @as(i128, @intCast(timer_delay_ms)));
 }
 
 test "kqueue: socket accept/cancel cancellation should decrease active count" {
