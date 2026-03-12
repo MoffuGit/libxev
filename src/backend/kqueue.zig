@@ -793,6 +793,11 @@ pub const Loop = struct {
                 break :action .{ .kevent = {} };
             },
 
+            .vnode => action: {
+                ev.* = c.kevent().?;
+                break :action .{.kevent = {} };
+            },
+
             .proc => action: {
                 ev.* = c.kevent().?;
                 break :action .{ .kevent = {} };
@@ -1093,6 +1098,15 @@ pub const Completion = struct {
                 };
             },
 
+            .vnode => |v| kevent_init(.{
+              .ident = @intCast(v.fd),
+              .filter = std.c.EVFILT.VNODE,
+              .flags = std.c.EV.ADD | std.c.EV.ENABLE | std.c.EV.CLEAR,
+              .fflags = v.flags,
+              .data = 0,
+              .udata = @intFromPtr(self),
+            }),
+
             .proc => |v| kevent_init(.{
                 .ident = @intCast(v.pid),
                 .filter = std.c.EVFILT.PROC,
@@ -1258,6 +1272,11 @@ pub const Completion = struct {
                 .machport = {},
             },
 
+            .vnode => res: {
+              const ev = ev_ orelse break :res .{ .vnode = VNodeError.MissingKevent };
+              break :res .{ .vnode = ev.fflags };
+            },
+
             // For proc watching, it is identical to the syscall result.
             .proc => res: {
                 const ev = ev_ orelse break :res .{ .proc = ProcError.MissingKevent };
@@ -1376,6 +1395,14 @@ pub const Completion = struct {
                     .CANCELED => error.Canceled,
                     else => |err| posix.unexpectedErrno(err),
                 },
+            },
+
+            .vnode => .{
+              .vnode = switch (errno) {
+                  .SUCCESS => @intCast(r),
+                  .CANCELED => error.Canceled,
+                  else => |err| posix.unexpectedErrno(err),
+              },
             },
 
             .proc => .{
@@ -1518,6 +1545,7 @@ pub const OperationType = enum {
     cancel,
     machport,
     proc,
+    vnode,
 };
 
 /// All the supported operations of this event loop. These are always
@@ -1611,6 +1639,11 @@ pub const Operation = union(OperationType) {
         pid: posix.pid_t,
         flags: u32 = NOTE_EXIT_FLAGS,
     },
+
+    vnode: struct {
+        fd: posix.fd_t,
+        flags: u32,
+    },
 };
 
 pub const Result = union(OperationType) {
@@ -1631,6 +1664,13 @@ pub const Result = union(OperationType) {
     cancel: CancelError!void,
     machport: MachPortError!void,
     proc: ProcError!u32,
+    vnode: VNodeError!u32
+};
+
+pub const VNodeError = posix.KEventError || error{
+    MissingKevent,
+    Canceled,
+    Unexpected,
 };
 
 const ThreadPoolError = error{
@@ -2774,4 +2814,101 @@ test "kqueue: socket accept/cancel cancellation should decrease active count" {
     // Wait for the sockets to close
     try loop.run(.until_done);
     try testing.expect(ln == 0);
+}
+
+test "kqueue: vnode events" {
+    if (!available()) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const fs = std.fs;
+
+    var loop = try Loop.init(.{});
+    defer loop.deinit();
+
+    const path = "test_vnode_file";
+
+    // Create the file to watch
+    var file = try fs.cwd().createFile(path, .{});
+    errdefer fs.cwd().deleteFile(path) catch {};
+
+    {
+        errdefer {
+            file.close();
+            fs.cwd().deleteFile(path) catch {};
+        }
+
+        // Test NOTE.WRITE
+        var write_flags: u32 = 0;
+        var c_write_vnode: Completion = .{
+            .op = .{
+                .vnode = .{
+                    .fd = file.handle,
+                    .flags = std.c.NOTE.WRITE,
+                },
+            },
+            .userdata = &write_flags,
+            .callback = (struct {
+                fn callback(
+                    ud: ?*anyopaque,
+                    l: *Loop,
+                    c: *Completion,
+                    r: Result,
+                ) CallbackAction {
+                    _ = l;
+                    _ = c;
+                    const flags_ptr: *u32 = @ptrCast(@alignCast(ud.?));
+                    flags_ptr.* = r.vnode catch unreachable;
+                    return .disarm;
+                }
+            }).callback,
+        };
+        loop.add(&c_write_vnode);
+
+        try loop.run(.no_wait);
+
+        // Trigger a write event
+        _ = try file.write("hello");
+
+        // Run the loop to process the event
+        try loop.run(.until_done);
+        try testing.expectEqual(std.c.NOTE.WRITE, write_flags);
+        try testing.expect(c_write_vnode.state() == .dead);
+    }
+
+
+    var delete_flags: u32 = 0;
+    var c_delete_vnode: Completion = .{
+        .op = .{
+            .vnode = .{
+                .fd = file.handle,
+                .flags = std.c.NOTE.DELETE,
+            },
+        },
+        .userdata = &delete_flags,
+        .callback = (struct {
+            fn callback(
+                ud: ?*anyopaque,
+                l: *Loop,
+                c: *Completion,
+                r: Result,
+            ) CallbackAction {
+                _ = l;
+                _ = c;
+                const flags_ptr: *u32 = @ptrCast(@alignCast(ud.?));
+                flags_ptr.* = r.vnode catch unreachable;
+                return .disarm;
+            }
+        }).callback,
+    };
+    loop.add(&c_delete_vnode);
+
+    try loop.run(.no_wait);
+
+    // Trigger a delete event
+    try fs.cwd().deleteFile(path);
+
+    // Run the loop to process the event
+    try loop.run(.until_done);
+    try testing.expectEqual(std.c.NOTE.DELETE | std.c.NOTE.LINK, delete_flags);
+    try testing.expect(c_delete_vnode.state() == .dead);
 }
