@@ -345,6 +345,42 @@ pub fn Intrusive(
             }
             return z; // Return the removed node
         }
+        pub const Iterator = struct {
+            current: ?*T,
+
+            pub fn next(self: *Iterator) ?*T {
+                const node = self.current orelse return null;
+                if (node.rb_node.right) |right| {
+                    var n = right;
+                    while (n.rb_node.left) |left| {
+                        n = left;
+                    }
+                    self.current = n;
+                } else {
+                    var n = node;
+                    while (n.rb_node.parent) |parent| {
+                        if (n == parent.rb_node.left) {
+                            self.current = parent;
+                            return node;
+                        }
+                        n = parent;
+                    }
+                    self.current = null;
+                }
+                return node;
+            }
+        };
+
+        pub fn iter(self: *Self) Iterator {
+            var current = self.root;
+            if (current != null) {
+                while (current.?.rb_node.left) |left| {
+                    current = left;
+                }
+            }
+            return .{ .current = current };
+        }
+
         pub fn replace(self: *Self, old: *T, new: *T) !void {
             if (T.compare(old, new) != .eq) {
                 return error.NotEqual;

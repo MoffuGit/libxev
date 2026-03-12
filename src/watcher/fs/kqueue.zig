@@ -124,10 +124,13 @@ pub fn FileSystem(comptime xev: type) type {
         }
 
         pub fn deinit(self: *Self) void {
-            _ = self;
-            //NOTE:
-            //assume that the loop is stoped or already removed from memory
-            //you need to close every fd, for that you need to iter over the tree
+            var it = self.tree.iter();
+            while (it.next()) |w| {
+                if (w.monitor.fd != -1) {
+                    posix.close(w.monitor.fd);
+                    w.monitor.fd = -1;
+                }
+            }
         }
 
         pub fn start(self: *Self, loop: *xev.Loop) !void {

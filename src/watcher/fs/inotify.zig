@@ -66,11 +66,7 @@ pub fn FileSystem(comptime xev: type) type {
         }
 
         pub fn deinit(self: *Self) void {
-            _ = self;
-            //WARN:
-            //i need to cancel the poll completion
-            // self.loop.cancel(self.c);
-            // posix.close(self.fd);
+            posix.close(self.fd);
         }
 
         pub fn start(self: *Self, loop: *xev.Loop) !void {
