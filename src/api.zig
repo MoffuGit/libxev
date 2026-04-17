@@ -39,6 +39,10 @@ pub fn Xev(comptime be: Backend, comptime T: type) type {
         pub const CallbackAction = loop.CallbackAction;
         pub const CompletionState = loop.CompletionState;
 
+        /// Forward global helpers so callers can use backend-specific
+        /// and dynamic APIs interchangeably.
+        pub const ThreadPool = @import("ThreadPool.zig");
+
         /// Error types
         pub const AcceptError = T.AcceptError;
         pub const CancelError = T.CancelError;
