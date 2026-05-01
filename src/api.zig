@@ -28,6 +28,8 @@ pub fn Xev(comptime be: Backend, comptime T: type) type {
         /// current system.
         pub const available = T.available;
 
+        pub const ThreadPool = @import("ThreadPool.zig");
+
         /// The core loop APIs.
         pub const Loop = T.Loop;
         pub const Completion = T.Completion;
